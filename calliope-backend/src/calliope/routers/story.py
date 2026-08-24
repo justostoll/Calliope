@@ -73,7 +73,10 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
             target_duration=project["target_duration"],
         )
         result = await generate_structured(
-            messages, temperature=0.7, expected_any=("beats",)
+            messages,
+            temperature=0.7,
+            expected_any=("beats",),
+            salvage={"beats": ("order_index", "description")},
         )
         beats_out = result.get("beats") or []
 
@@ -107,7 +110,10 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                 },
             ]
             result = await generate_structured(
-                repair, temperature=0.4, expected_any=("beats",)
+                repair,
+                temperature=0.4,
+                expected_any=("beats",),
+                salvage={"beats": ("order_index", "description")},
             )
             beats_out = result.get("beats") or []
             if len(beats_out) < required_beats:

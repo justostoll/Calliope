@@ -631,3 +631,105 @@ async def test_generate_structured_recovers_from_truncated_reply(monkeypatch):
     assert result == {"beats": [{"order_index": 1}]}
     assert len(router.requests) == 2
     assert router.requests[1].get("response_format") == {"type": "json_object"}
+
+
+# ---------- salvage: rescue well-formed items from an unparseable document ----------
+# Observed live: a single corrupted token mid-array (`いorder_index":` where
+# `{ "` belongs) malforms the WHOLE document while every other item is
+# perfectly well-formed. With salvage markers, extract_json rebuilds the
+# envelope from the surviving items instead of raising.
+
+BEAT_SALVAGE = {"beats": ("order_index", "description")}
+
+# Beat 2's opening `{ "` is corrupted to a stray token — the real specimen shape.
+CORRUPTED_TOKEN_DOC = (
+    '```json\n{"title": "X", "logline": "y", "beats": [\n'
+    '    {"order_index": 1, "title": "Open", "description": "a"},\n'
+    '    いorder_index": 2, "title": "Lost", "description": "b"},\n'
+    '    {"order_index": 3, "title": "Turn", "description": "c"},\n'
+    '    {"order_index": 4, "title": "End", "description": "d"}\n'
+    '  ],\n'
+    '  "characters": [{"name": "Mia", "role": "lead"}]\n'
+    '}\n```'
+)
+
+
+def test_salvage_recovers_items_from_corrupted_token_doc():
+    result = extract_json(
+        CORRUPTED_TOKEN_DOC, expected_any=("beats",), salvage=BEAT_SALVAGE
+    )
+    beats = result["beats"]
+    assert [b["order_index"] for b in beats] == [1, 3, 4]  # beat 2 stays lost
+    assert all("description" in b for b in beats)
+
+
+def test_salvage_excludes_fragments_without_markers():
+    # The characters fragment parses but lacks order_index/description —
+    # it must not be swept into the beats.
+    result = extract_json(
+        CORRUPTED_TOKEN_DOC, expected_any=("beats",), salvage=BEAT_SALVAGE
+    )
+    assert all("name" not in b for b in result["beats"])
+
+
+def test_salvage_recovers_complete_items_from_truncated_doc():
+    # Token-cap truncation mid-item: the complete beats before the cut survive.
+    doc = (
+        '{"title": "X", "beats": ['
+        '{"order_index": 1, "title": "A", "description": "a"}, '
+        '{"order_index": 2, "title": "B", "description": "b"}, '
+        '{"order_index": 3, "title": "C", "description": "c"}, '
+        '{"order_index": 4, "title": "D", "descri'
+    )
+    result = extract_json(doc, expected_any=("beats",), salvage=BEAT_SALVAGE)
+    assert [b["order_index"] for b in result["beats"]] == [1, 2, 3]
+
+
+def test_salvage_threshold_single_item_still_raises():
+    # One surviving beat is indistinguishable from the first-object trap.
+    doc = '{"beats": [{"order_index": 1, "description": "a"}, {"broken": '
+    with pytest.raises(ValueError, match="none of the expected keys"):
+        extract_json(doc, expected_any=("beats",), salvage=BEAT_SALVAGE)
+
+
+def test_salvage_not_consulted_on_clean_parse():
+    # A complete valid document wins outright; salvage never runs.
+    doc = '{"title": "X"}'
+    assert extract_json(doc, expected_any=("beats",), salvage=BEAT_SALVAGE) == {
+        "title": "X"
+    }
+
+
+async def test_generate_structured_salvages_without_retry(monkeypatch):
+    """A salvageable first reply returns immediately — no json_object retry."""
+
+    class _Router:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            self.requests.append(body)
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": CORRUPTED_TOKEN_DOC}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    router = _Router()
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(router))
+    )
+    monkeypatch.setattr("calliope.agent.llm.LLMClient", lambda: client)
+
+    from calliope.agent.llm import generate_structured
+
+    result = await generate_structured(
+        [{"role": "user", "content": "hi"}],
+        expected_any=("beats",),
+        salvage=BEAT_SALVAGE,
+    )
+
+    assert [b["order_index"] for b in result["beats"]] == [1, 3, 4]
+    assert len(router.requests) == 1  # salvage succeeded on the first attempt

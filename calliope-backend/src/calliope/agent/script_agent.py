@@ -123,7 +123,10 @@ async def generate_script(
             scene_count=required_scenes,
         )
         result = await generate_structured(
-            messages, temperature=0.7, expected_any=("scenes",)
+            messages,
+            temperature=0.7,
+            expected_any=("scenes",),
+            salvage={"scenes": ("order_index", "action")},
         )
         scenes_out = result.get("scenes") or []
 
@@ -150,7 +153,10 @@ async def generate_script(
                 },
             ]
             result = await generate_structured(
-                retry_messages, temperature=0.5, expected_any=("scenes",)
+                retry_messages,
+                temperature=0.5,
+                expected_any=("scenes",),
+                salvage={"scenes": ("order_index", "action")},
             )
             scenes_out = result.get("scenes") or []
             if len(scenes_out) < required_scenes:

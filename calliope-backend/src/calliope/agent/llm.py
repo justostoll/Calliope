@@ -334,8 +334,49 @@ class LLMClient:
                 yield {"type": "finish", "reason": "length"}
 
 
+def _salvage_items(
+    text: str,
+    salvage: dict[str, tuple[str, ...]],
+    decoder: json.JSONDecoder,
+) -> dict[str, Any] | None:
+    """Rescue well-formed items from an unparseable document.
+
+    A single corrupted token mid-array (observed live: `いorder_index":` where
+    `{ "` belongs) malforms the WHOLE document while every other item stays
+    perfectly well-formed. Collect the outermost balanced objects in document
+    order, keep the ones matching an envelope key's marker keys, and rebuild
+    that envelope. Requires >= 2 matches — a single fragment is
+    indistinguishable from the first-object trap this path exists to avoid.
+    Items are returned verbatim (a lost item stays lost; nothing is invented).
+    """
+    fragments: list[dict[str, Any]] = []
+    pos = text.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(text[pos:])
+            if isinstance(obj, dict):
+                fragments.append(obj)
+                pos = text.find("{", pos + end)
+                continue
+        except json.JSONDecodeError:
+            pass
+        pos = text.find("{", pos + 1)
+    for key, markers in salvage.items():
+        items = [f for f in fragments if all(m in f for m in markers)]
+        if len(items) >= 2:
+            logger.warning(
+                "Salvaged %d '%s' items from an unparseable LLM reply "
+                "(%d balanced fragments scanned)",
+                len(items), key, len(fragments),
+            )
+            return {key: items}
+    return None
+
+
 def extract_json(
-    text: str, expected_any: tuple[str, ...] | None = None
+    text: str,
+    expected_any: tuple[str, ...] | None = None,
+    salvage: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     """Extract a JSON object from a model reply.
 
@@ -350,6 +391,12 @@ def extract_json(
     never fires. If the fallback's result contains none of the expected keys,
     raise instead. Clean and fenced parses are never affected: a complete,
     valid document is the model's actual answer, whatever its keys.
+
+    `salvage` (only consulted where the expected_any guard would raise) maps
+    an envelope key to the marker keys its items must all carry, e.g.
+    {"beats": ("order_index", "description")}. When >= 2 well-formed items can
+    be recovered from the wreck, return {key: items} instead of raising —
+    the caller's count validation then decides whether the partial is enough.
     """
     text = text.strip()
     if not text:
@@ -423,6 +470,10 @@ def extract_json(
             parsed, _ = decoder.raw_decode(text[start:])
             if isinstance(parsed, dict):
                 if expected_any and not any(k in parsed for k in expected_any):
+                    if salvage:
+                        salvaged = _salvage_items(text, salvage, decoder)
+                        if salvaged is not None:
+                            return salvaged
                     raise ValueError(
                         "LLM reply was unparseable as a whole and the recovered "
                         f"fragment has none of the expected keys {expected_any} "
@@ -440,6 +491,7 @@ async def generate_structured(
     messages: list[dict[str, str]],
     temperature: float = 0.7,
     expected_any: tuple[str, ...] | None = None,
+    salvage: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     client = LLMClient()
     try:
@@ -452,13 +504,13 @@ async def generate_structured(
             # reach the retry below, so it lives inside this try alongside the
             # parse.
             text = await client.chat(messages, temperature=temperature)
-            return extract_json(text, expected_any=expected_any)
+            return extract_json(text, expected_any=expected_any, salvage=salvage)
         except ValueError as exc:
             # One retry with JSON mode requested, for servers that support it
             logger.warning("LLM reply unusable (%s); retrying with json_object mode", exc)
             text = await client.chat(
                 messages, temperature=temperature, response_format={"type": "json_object"}
             )
-            return extract_json(text, expected_any=expected_any)
+            return extract_json(text, expected_any=expected_any, salvage=salvage)
     finally:
         await client.close()
