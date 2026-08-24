@@ -344,10 +344,13 @@ def _salvage_items(
     A single corrupted token mid-array (observed live: `いorder_index":` where
     `{ "` belongs) malforms the WHOLE document while every other item stays
     perfectly well-formed. Collect the outermost balanced objects in document
-    order, keep the ones matching an envelope key's marker keys, and rebuild
-    that envelope. Requires >= 2 matches — a single fragment is
-    indistinguishable from the first-object trap this path exists to avoid.
-    Items are returned verbatim (a lost item stays lost; nothing is invented).
+    order, and classify them by marker keys into the envelope keys of
+    `salvage` — each fragment is claimed by the FIRST key whose markers it
+    fully matches, so tiers cannot double-collect. The salvage is valid only
+    when at least one key recovers >= 2 items (a single fragment is
+    indistinguishable from the first-object trap this path exists to avoid);
+    once anchored, smaller tiers ride along with >= 1. Items are returned
+    verbatim (a lost item stays lost; nothing is invented).
     """
     fragments: list[dict[str, Any]] = []
     pos = text.find("{")
@@ -361,15 +364,19 @@ def _salvage_items(
         except json.JSONDecodeError:
             pass
         pos = text.find("{", pos + 1)
-    for key, markers in salvage.items():
-        items = [f for f in fragments if all(m in f for m in markers)]
-        if len(items) >= 2:
-            logger.warning(
-                "Salvaged %d '%s' items from an unparseable LLM reply "
-                "(%d balanced fragments scanned)",
-                len(items), key, len(fragments),
-            )
-            return {key: items}
+    salvaged: dict[str, list[dict[str, Any]]] = {}
+    for frag in fragments:
+        for key, markers in salvage.items():
+            if all(m in frag for m in markers):
+                salvaged.setdefault(key, []).append(frag)
+                break
+    if salvaged and any(len(v) >= 2 for v in salvaged.values()):
+        logger.warning(
+            "Salvaged %s from an unparseable LLM reply (%d balanced fragments scanned)",
+            ", ".join(f"{len(v)} '{k}'" for k, v in salvaged.items()),
+            len(fragments),
+        )
+        return salvaged
     return None
 
 

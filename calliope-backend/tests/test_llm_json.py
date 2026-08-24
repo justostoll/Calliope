@@ -733,3 +733,51 @@ async def test_generate_structured_salvages_without_retry(monkeypatch):
 
     assert [b["order_index"] for b in result["beats"]] == [1, 3, 4]
     assert len(router.requests) == 1  # salvage succeeded on the first attempt
+
+
+# ---------- salvage tiers: characters ride along with the beats anchor ----------
+
+STORY_SALVAGE = {
+    "beats": ("order_index", "description"),
+    "characters": ("name", "role"),
+}
+
+
+def test_salvage_recovers_characters_alongside_beats():
+    result = extract_json(
+        CORRUPTED_TOKEN_DOC, expected_any=("beats",), salvage=STORY_SALVAGE
+    )
+    assert [b["order_index"] for b in result["beats"]] == [1, 3, 4]
+    assert [c["name"] for c in result["characters"]] == ["Mia"]
+
+
+def test_salvage_single_character_rides_on_beats_anchor():
+    # One character is below the >=2 threshold on its own, but a tier with a
+    # valid anchor (3 beats) carries it.
+    result = extract_json(
+        CORRUPTED_TOKEN_DOC, expected_any=("beats",), salvage=STORY_SALVAGE
+    )
+    assert len(result["characters"]) == 1
+
+
+def test_salvage_no_anchor_still_raises():
+    # One beat + one character: no tier reaches 2, so the wreck is not
+    # distinguishable from the first-object trap — raise as before.
+    doc = (
+        '{"beats": [{"order_index": 1, "description": "a"}], '
+        '"characters": [{"name": "Mia", "role": "lead"}], "broken": '
+    )
+    with pytest.raises(ValueError, match="none of the expected keys"):
+        extract_json(doc, expected_any=("beats",), salvage=STORY_SALVAGE)
+
+
+def test_salvage_fragment_claimed_by_first_matching_tier_only():
+    # A fragment matching BOTH tiers' markers lands in beats (first key) and
+    # is not duplicated into characters.
+    doc = (
+        'wreck: {"order_index": 1, "description": "a", "name": "Mia", "role": "lead"}, '
+        '{"order_index": 2, "description": "b"}, broken {'
+    )
+    result = extract_json(doc, expected_any=("beats",), salvage=STORY_SALVAGE)
+    assert len(result["beats"]) == 2
+    assert "characters" not in result

@@ -76,7 +76,10 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
             messages,
             temperature=0.7,
             expected_any=("beats",),
-            salvage={"beats": ("order_index", "description")},
+            salvage={
+                "beats": ("order_index", "description"),
+                "characters": ("name", "role"),
+            },
         )
         beats_out = result.get("beats") or []
 
@@ -113,7 +116,10 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                 repair,
                 temperature=0.4,
                 expected_any=("beats",),
-                salvage={"beats": ("order_index", "description")},
+                salvage={
+                "beats": ("order_index", "description"),
+                "characters": ("name", "role"),
+            },
             )
             beats_out = result.get("beats") or []
             if len(beats_out) < required_beats:
