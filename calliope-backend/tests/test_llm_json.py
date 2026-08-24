@@ -54,7 +54,7 @@ def test_extract_json_empty():
 
 # ---------- LLMClient response_format fallback ----------
 
-def _sse_body(message: dict) -> bytes:
+def _sse_body(message: dict, finish: str = "stop") -> bytes:
     """Encode a full assistant message as a minimal SSE stream."""
     chunks = []
     if message.get("reasoning_content"):
@@ -63,7 +63,7 @@ def _sse_body(message: dict) -> bytes:
         )
     if message.get("content"):
         chunks.append({"choices": [{"delta": {"content": message["content"]}}]})
-    chunks.append({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    chunks.append({"choices": [{"delta": {}, "finish_reason": finish}]})
     lines = [b"data: " + json.dumps(c).encode() for c in chunks]
     lines.append(b"data: [DONE]")
     return b"\n".join(lines) + b"\n"
@@ -510,3 +510,124 @@ async def test_chat_reasoning_only_stream_raises_value_error(monkeypatch):
 
     with pytest.raises(ValueError, match="no content"):
         await client.chat([{"role": "user", "content": "hi"}])
+
+
+# ---------- envelope guard + truncation (the extract_json first-object trap) ----------
+# When the whole document is unparseable (truncated at a token cap, or malformed
+# mid-document) the balanced-scan fallback "succeeds" on the first INNER object —
+# a single beat instead of {"beats": [...]} — and the retry ladder never fires.
+# expected_any guards the fallback only; finish_reason=length raises in chat().
+
+TRUNCATED_BEATS = (
+    'Here is your storyline:\n{"title": "X", "beats": ['
+    '{"order_index": 1, "title": "Open", "description": "a"}, '
+    '{"order_index": 2, "title": "Turn", "descri'  # cut mid-key by the token cap
+)
+
+MALFORMED_BEATS = (
+    '{"title": "X", "beats": ['
+    '{"order_index": 1, "title": "Open"} '
+    '{"order_index": 2, "title": "Turn"}]}'  # missing comma mid-document
+)
+
+
+def test_extract_json_fallback_returns_first_object_without_guard():
+    # Documents the trap this guard exists for: no expected_any -> first beat.
+    assert extract_json(TRUNCATED_BEATS)["order_index"] == 1
+    assert extract_json(MALFORMED_BEATS)["order_index"] == 1
+
+
+def test_extract_json_fallback_rejects_wrong_envelope_truncated():
+    with pytest.raises(ValueError, match="none of the expected keys"):
+        extract_json(TRUNCATED_BEATS, expected_any=("beats",))
+
+
+def test_extract_json_fallback_rejects_wrong_envelope_malformed():
+    with pytest.raises(ValueError, match="none of the expected keys"):
+        extract_json(MALFORMED_BEATS, expected_any=("beats",))
+
+
+def test_extract_json_clean_parse_ignores_expected_any():
+    # A complete, valid document is the model's actual answer, whatever its
+    # keys — the guard applies to the fallback only.
+    assert extract_json('{"title": "X"}', expected_any=("beats",)) == {"title": "X"}
+
+
+def test_extract_json_fallback_passes_with_expected_key():
+    text = 'Sure! {"beats": [{"order_index": 1}]} hope that helps'
+    assert extract_json(text, expected_any=("beats",))["beats"]
+
+
+async def test_chat_raises_on_length_finish(monkeypatch):
+    class _Router:
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": '{"beats": ['}, finish="length"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(_Router()))
+    )
+    with pytest.raises(ValueError, match="truncated"):
+        await client.chat([{"role": "user", "content": "hi"}])
+
+
+async def test_chat_stream_yields_finish_event_on_length(monkeypatch):
+    class _Router:
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": "partial"}, finish="length"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(_Router()))
+    )
+    events = [ev async for ev in client.chat_stream([{"role": "user", "content": "hi"}])]
+    assert {"type": "finish", "reason": "length"} in events
+    assert events[-1] == {"type": "done"}
+
+
+async def test_generate_structured_recovers_from_truncated_reply(monkeypatch):
+    """finish_reason=length on the first attempt -> retry rescues it."""
+
+    class _Router:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            self.requests.append(body)
+            if len(self.requests) == 1:
+                return httpx.Response(
+                    200,
+                    content=_sse_body({"content": '{"beats": ['}, finish="length"),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": '{"beats": [{"order_index": 1}]}'}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    router = _Router()
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(router))
+    )
+    monkeypatch.setattr("calliope.agent.llm.LLMClient", lambda: client)
+
+    from calliope.agent.llm import generate_structured
+
+    result = await generate_structured(
+        [{"role": "user", "content": "hi"}], expected_any=("beats",)
+    )
+
+    assert result == {"beats": [{"order_index": 1}]}
+    assert len(router.requests) == 2
+    assert router.requests[1].get("response_format") == {"type": "json_object"}

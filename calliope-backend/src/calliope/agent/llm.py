@@ -43,6 +43,7 @@ class LLMClient:
         try:
             parts: list[str] = []
             reasoning_chars = 0
+            truncated = False
             async for ev in self.chat_stream(
                 messages, temperature=temperature, response_format=response_format
             ):
@@ -50,6 +51,8 @@ class LLMClient:
                     parts.append(ev["content"])
                 elif ev["type"] == "reasoning":
                     reasoning_chars += len(ev["content"])
+                elif ev["type"] == "finish" and ev["reason"] == "length":
+                    truncated = True
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in _STREAM_UNSUPPORTED_STATUS:
                 raise
@@ -61,6 +64,15 @@ class LLMClient:
             )
             return await self._chat_blocking(messages, temperature, response_format)
         content = "".join(parts).strip()
+        if truncated:
+            # A completion cut off at the server's token cap is never a valid
+            # structured reply — parsing it "successfully" returns the first
+            # inner object (a single beat instead of the envelope). Raise so
+            # the retry ladder fires instead of a silent wrong answer.
+            raise ValueError(
+                "LLM completion truncated (finish_reason=length, "
+                f"content_chars={len(content)}, reasoning_chars={reasoning_chars})"
+            )
         if not content:
             # Thinking models can burn the whole completion in reasoning and
             # stream no content tokens at all. Raise ValueError so
@@ -206,6 +218,8 @@ class LLMClient:
         - {"type": "reasoning", "content": str}      — reasoning/thinking token
         - {"type": "tool_call", "tool_call": {...}}  — one complete tool call
           (argument fragments accumulated across chunks)
+        - {"type": "finish", "reason": "length"}     — completion truncated at
+          the server's token cap
         - {"type": "done"}                           — stream finished
 
         On HTTP 400 the optional fields are dropped one at a time
@@ -313,14 +327,29 @@ class LLMClient:
                     if tool_acc[idx]["function"]["name"]:
                         yield {"type": "tool_call", "tool_call": tool_acc[idx]}
                 tool_acc.clear()
+            elif finish == "length":
+                # Completion hit the server's token cap — surface it so
+                # structured consumers can treat the reply as unusable.
+                # (Chat-loop consumers ignore unknown event types.)
+                yield {"type": "finish", "reason": "length"}
 
 
-def extract_json(text: str) -> dict[str, Any]:
+def extract_json(
+    text: str, expected_any: tuple[str, ...] | None = None
+) -> dict[str, Any]:
     """Extract a JSON object from a model reply.
 
     Handles the messy shapes local models actually produce: raw JSON, fenced
     code blocks, JSON embedded in prose, and valid JSON followed by trailing
     chatter ("Extra data: line 1 column N" failures).
+
+    `expected_any` guards the LAST-RESORT balanced-scan fallback only: when
+    the whole document is unparseable (truncated at a token cap, or malformed
+    mid-document) the scan would otherwise "succeed" on the first INNER object
+    — e.g. a single beat instead of {"beats": [...]} — and the caller's retry
+    never fires. If the fallback's result contains none of the expected keys,
+    raise instead. Clean and fenced parses are never affected: a complete,
+    valid document is the model's actual answer, whatever its keys.
     """
     text = text.strip()
     if not text:
@@ -393,6 +422,13 @@ def extract_json(text: str) -> dict[str, Any]:
         try:
             parsed, _ = decoder.raw_decode(text[start:])
             if isinstance(parsed, dict):
+                if expected_any and not any(k in parsed for k in expected_any):
+                    raise ValueError(
+                        "LLM reply was unparseable as a whole and the recovered "
+                        f"fragment has none of the expected keys {expected_any} "
+                        f"(got {sorted(parsed)[:6]}) — likely a truncated or "
+                        "malformed envelope"
+                    )
                 return parsed
         except json.JSONDecodeError:
             pass
@@ -401,7 +437,9 @@ def extract_json(text: str) -> dict[str, Any]:
 
 
 async def generate_structured(
-    messages: list[dict[str, str]], temperature: float = 0.7
+    messages: list[dict[str, str]],
+    temperature: float = 0.7,
+    expected_any: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     client = LLMClient()
     try:
@@ -409,17 +447,18 @@ async def generate_structured(
         # (notably LM Studio) reject response_format, and the prompts already
         # instruct the model to answer with a single JSON object.
         try:
-            # chat() itself can raise ValueError for reasoning-only replies
-            # (no `content` key) — that must reach the retry below, so it
-            # lives inside this try alongside the parse.
+            # chat() itself can raise ValueError (reasoning-only reply with no
+            # content, or a completion truncated at the token cap) — that must
+            # reach the retry below, so it lives inside this try alongside the
+            # parse.
             text = await client.chat(messages, temperature=temperature)
-            return extract_json(text)
+            return extract_json(text, expected_any=expected_any)
         except ValueError as exc:
             # One retry with JSON mode requested, for servers that support it
             logger.warning("LLM reply unusable (%s); retrying with json_object mode", exc)
             text = await client.chat(
                 messages, temperature=temperature, response_format={"type": "json_object"}
             )
-            return extract_json(text)
+            return extract_json(text, expected_any=expected_any)
     finally:
         await client.close()

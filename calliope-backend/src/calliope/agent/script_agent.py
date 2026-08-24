@@ -122,7 +122,9 @@ async def generate_script(
             target_duration=p.get("target_duration"),
             scene_count=required_scenes,
         )
-        result = await generate_structured(messages, temperature=0.7)
+        result = await generate_structured(
+            messages, temperature=0.7, expected_any=("scenes",)
+        )
         scenes_out = result.get("scenes") or []
 
         if len(scenes_out) < required_scenes:
@@ -147,7 +149,9 @@ async def generate_script(
                     ),
                 },
             ]
-            result = await generate_structured(retry_messages, temperature=0.5)
+            result = await generate_structured(
+                retry_messages, temperature=0.5, expected_any=("scenes",)
+            )
             scenes_out = result.get("scenes") or []
             if len(scenes_out) < required_scenes:
                 raise ValueError(

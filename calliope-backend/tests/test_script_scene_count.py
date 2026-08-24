@@ -25,7 +25,7 @@ def test_build_script_messages_honors_expanded_scene_count():
 def test_script_regenerate_keeps_expanded_count(client, monkeypatch):
     calls: list[int] = []
 
-    async def fake_structured(messages, temperature=0.7):
+    async def fake_structured(messages, temperature=0.7, expected_any=None):
         user = messages[1]["content"]
         # Parse required count from prompt
         n = 4

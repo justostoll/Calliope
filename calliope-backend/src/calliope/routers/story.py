@@ -72,7 +72,9 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
             tone=project["tone"],
             target_duration=project["target_duration"],
         )
-        result = await generate_structured(messages, temperature=0.7)
+        result = await generate_structured(
+            messages, temperature=0.7, expected_any=("beats",)
+        )
         beats_out = result.get("beats") or []
 
         # Models often under-deliver on long runtimes — one corrective retry.
@@ -104,7 +106,9 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                     ),
                 },
             ]
-            result = await generate_structured(repair, temperature=0.4)
+            result = await generate_structured(
+                repair, temperature=0.4, expected_any=("beats",)
+            )
             beats_out = result.get("beats") or []
             if len(beats_out) < required_beats:
                 raise HTTPException(
