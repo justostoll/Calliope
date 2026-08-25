@@ -781,3 +781,154 @@ def test_salvage_fragment_claimed_by_first_matching_tier_only():
     result = extract_json(doc, expected_any=("beats",), salvage=STORY_SALVAGE)
     assert len(result["beats"]) == 2
     assert "characters" not in result
+
+
+# ---------- truncation + salvage: rescue the partial before burning a retry ----------
+# (Observed live 2026-08-25: a 43-scene script regen truncated at the server
+# cap with ~102K chars of content; the guard discarded text that salvage could
+# have partially rescued — pre-guard, a truncated reply once yielded 42/42
+# scenes. LLMTruncatedError now carries the partial.)
+
+TRUNCATED_RICH = (
+    '{"scenes": ['
+    '{"order_index": 1, "heading": "EXT. CITY", "action": "a", "dialog": "L: hi"}, '
+    '{"order_index": 2, "heading": "INT. SPIRE", "action": "b", "dialog": ""}, '
+    '{"order_index": 3, "heading": "INT. HALL", "action": "c", "dialog": "K: no"}, '
+    '{"order_index": 4, "heading": "INT. VAULT", "action": "d'  # cut by the cap
+)
+
+SCENE_SALVAGE = {"scenes": ("order_index", "action")}
+
+
+async def test_chat_truncation_error_carries_partial(monkeypatch):
+    from calliope.agent.llm import LLMTruncatedError
+
+    class _Router:
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": TRUNCATED_RICH}, finish="length"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(_Router()))
+    )
+    with pytest.raises(LLMTruncatedError) as ei:
+        await client.chat([{"role": "user", "content": "hi"}])
+    assert isinstance(ei.value, ValueError)  # retry-ladder compatibility
+    assert ei.value.partial == TRUNCATED_RICH
+
+
+async def test_generate_structured_rescues_truncated_partial(monkeypatch):
+    """A truncated reply with >=2 complete items is salvaged with NO retry."""
+
+    class _Router:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(json.loads(request.content.decode()))
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": TRUNCATED_RICH}, finish="length"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    router = _Router()
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(router))
+    )
+    monkeypatch.setattr("calliope.agent.llm.LLMClient", lambda: client)
+
+    from calliope.agent.llm import generate_structured
+
+    result = await generate_structured(
+        [{"role": "user", "content": "hi"}],
+        expected_any=("scenes",),
+        salvage=SCENE_SALVAGE,
+    )
+
+    assert [s["order_index"] for s in result["scenes"]] == [1, 2, 3]  # 4 lost at cut
+    assert len(router.requests) == 1  # rescued without the json_object retry
+
+
+async def test_generate_structured_truncated_below_threshold_still_retries(monkeypatch):
+    """One complete item in the partial = the trap threshold — retry fires."""
+    thin = '{"scenes": [{"order_index": 1, "action": "a"}, {"order_index": 2, "act'
+
+    class _Router:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(json.loads(request.content.decode()))
+            if len(self.requests) == 1:
+                return httpx.Response(
+                    200,
+                    content=_sse_body({"content": thin}, finish="length"),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": '{"scenes": [{"order_index": 1, "action": "a"}]}'}),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    router = _Router()
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(router))
+    )
+    monkeypatch.setattr("calliope.agent.llm.LLMClient", lambda: client)
+
+    from calliope.agent.llm import generate_structured
+
+    result = await generate_structured(
+        [{"role": "user", "content": "hi"}],
+        expected_any=("scenes",),
+        salvage=SCENE_SALVAGE,
+    )
+    assert len(router.requests) == 2  # retry was needed
+    assert result["scenes"]
+
+
+async def test_generate_structured_rescues_truncated_retry(monkeypatch):
+    """First reply garbage, retry truncated-but-rich -> rescued on the retry."""
+
+    class _Router:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.requests.append(json.loads(request.content.decode()))
+            if len(self.requests) == 1:
+                return httpx.Response(
+                    200,
+                    content=_sse_body({"content": "sorry, prose only"}),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return httpx.Response(
+                200,
+                content=_sse_body({"content": TRUNCATED_RICH}, finish="length"),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    router = _Router()
+    client = LLMClient()
+    monkeypatch.setattr(
+        client, "client", httpx.AsyncClient(transport=httpx.MockTransport(router))
+    )
+    monkeypatch.setattr("calliope.agent.llm.LLMClient", lambda: client)
+
+    from calliope.agent.llm import generate_structured
+
+    result = await generate_structured(
+        [{"role": "user", "content": "hi"}],
+        expected_any=("scenes",),
+        salvage=SCENE_SALVAGE,
+    )
+    assert len(router.requests) == 2
+    assert [s["order_index"] for s in result["scenes"]] == [1, 2, 3]

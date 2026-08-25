@@ -10,6 +10,21 @@ from calliope.config import settings
 
 logger = logging.getLogger("calliope.llm")
 
+class LLMTruncatedError(ValueError):
+    """A completion cut off at the server's token cap (finish_reason=length).
+
+    Carries the PARTIAL accumulated content: a truncated structured reply can
+    still hold dozens of complete items (observed live 2026-08-24: 42/42
+    scenes salvaged from a truncated reply, pre-guard), so generate_structured
+    attempts salvage on `partial` before burning a full retry.
+    Subclasses ValueError so every existing retry-ladder handler still fires.
+    """
+
+    def __init__(self, message: str, partial: str = "") -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
 # Status codes that mean "this server does not do SSE streaming at all" —
 # chat()/chat_with_tools() then fall back to one plain blocking POST. Anything
 # else (401, 429, 5xx) is a real error and re-raises.
@@ -68,10 +83,12 @@ class LLMClient:
             # A completion cut off at the server's token cap is never a valid
             # structured reply — parsing it "successfully" returns the first
             # inner object (a single beat instead of the envelope). Raise so
-            # the retry ladder fires instead of a silent wrong answer.
-            raise ValueError(
+            # the retry ladder fires — but carry the partial content: complete
+            # items before the cut are salvageable.
+            raise LLMTruncatedError(
                 "LLM completion truncated (finish_reason=length, "
-                f"content_chars={len(content)}, reasoning_chars={reasoning_chars})"
+                f"content_chars={len(content)}, reasoning_chars={reasoning_chars})",
+                partial=content,
             )
         if not content:
             # Thinking models can burn the whole completion in reasoning and
@@ -501,6 +518,23 @@ async def generate_structured(
     salvage: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     client = LLMClient()
+
+    def _rescue_truncated(exc: ValueError) -> dict[str, Any] | None:
+        """Salvage complete items out of a truncated reply's partial content."""
+        if not (isinstance(exc, LLMTruncatedError) and exc.partial and salvage):
+            return None
+        try:
+            rescued = extract_json(
+                exc.partial, expected_any=expected_any, salvage=salvage
+            )
+        except ValueError:
+            return None
+        logger.warning(
+            "Rescued a truncated reply via salvage (%s)",
+            ", ".join(f"{len(v)} {k}" for k, v in rescued.items() if isinstance(v, list)),
+        )
+        return rescued
+
     try:
         # JSON mode is off by default: several OpenAI-compatible servers
         # (notably LM Studio) reject response_format, and the prompts already
@@ -513,11 +547,20 @@ async def generate_structured(
             text = await client.chat(messages, temperature=temperature)
             return extract_json(text, expected_any=expected_any, salvage=salvage)
         except ValueError as exc:
+            rescued = _rescue_truncated(exc)
+            if rescued is not None:
+                return rescued
             # One retry with JSON mode requested, for servers that support it
             logger.warning("LLM reply unusable (%s); retrying with json_object mode", exc)
-            text = await client.chat(
-                messages, temperature=temperature, response_format={"type": "json_object"}
-            )
-            return extract_json(text, expected_any=expected_any, salvage=salvage)
+            try:
+                text = await client.chat(
+                    messages, temperature=temperature, response_format={"type": "json_object"}
+                )
+                return extract_json(text, expected_any=expected_any, salvage=salvage)
+            except ValueError as exc2:
+                rescued = _rescue_truncated(exc2)
+                if rescued is not None:
+                    return rescued
+                raise
     finally:
         await client.close()
