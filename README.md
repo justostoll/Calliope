@@ -11,26 +11,7 @@ Calliope is a local-first story-to-video studio. You type a story idea; Calliope
 
 
 
-## Install — Windows EXE (recommended)
-
-1. Download **`Calliope-<version>-win-x64.zip`** (e.g. `Calliope-1.2.1-win-x64.zip`) from the [latest release](../../releases).
-2. Unzip it anywhere writable (avoid `Program Files`).
-3. Run `win-unpacked\Calliope.exe`.
-
-No installer, no dev setup. First launch shows a splash while the backend boots. Windows SmartScreen will warn on first run (unsigned binary) — that's expected: click **More info → Run anyway**.
-
-**Portable:** your projects, database, generated media, and settings live next to the app:
-
-```text
-<app>\resources\backend\data\                 projects database + generated assets
-<app>\resources\backend\calliope_config.json  created when you save Settings
-```
-
-Move or copy the whole unzipped folder to relocate the app together with its data.
-
 ## Install — from source (npm + Python)
-
-For development, or if you prefer running the web UI in a browser instead of the Electron shell.
 
 **Prerequisites**
 
@@ -65,8 +46,9 @@ Open `http://127.0.0.1:5173`. The dev server proxies `/api` to the backend on `1
 
 Open the app, go to **Settings**, and set:
 
-1. **LLM** — base URL, model name, and API key of your OpenAI-compatible endpoint
+1. **LLM** — one or more OpenAI-compatible endpoints (base URL, model name, API key). Save several, then pick which one is **Active**.
 2. **ComfyUI** — the base URL of your running ComfyUI (e.g. `http://127.0.0.1:8188`)
+3. **Agent** *(optional)* — assign a specific LLM per agent role (see below)
 
 Leave **Dry-run** off — it is meant for testing and produces placeholder results instead of real generations.
 
@@ -79,6 +61,13 @@ In **Settings → Queue** you can tune how the worker talks to ComfyUI:
 - **Poll timeout (seconds)** — how long Calliope keeps waiting on ComfyUI for a single job before failing it. **Default is `1800` (30 minutes).** Long video generations can easily exceed 10 minutes, so raise this for heavy workflows — or set it to **`0` to wait indefinitely** (until the job finishes or you cancel it).
 - **Max retries** — automatic retries before a job is marked failed.
 
+### Agent settings
+
+In **Settings → Agent**:
+
+- **Model per agent** — assign any saved LLM to each role: **Main agent, Planner, Story agent, Script agent, Assets agent, Video agent**. Blank means the **Active LLM** from Settings → LLM applies, so a single-endpoint setup needs no configuration here. A common setup is a strong cloud model for the main agent and planner, and a fast local model for the sub-agents. The Video agent's assignment also drives the MiniMax H3 prompt rewrite.
+- **System-prompt rules (hardening)** — operator rules appended to every agent system prompt. Leave blank to disable.
+
 ## Using the app
 
 The app walks a project through four stages — **Story, Assets, Script, Video**:
@@ -86,8 +75,8 @@ The app walks a project through four stages — **Story, Assets, Script, Video**
 - **Story:** describe your idea and **Draft Storyline** — this opens a project-linked chat in the Agents view with the prompt pre-filled, and the agent writes beats, characters, locations, and misc. items. Edit anything by hand before moving on.
 - **Assets:** each character, location, and item has its own **Image prompt**. Pick a workflow and shared settings (width/height/etc.) at the top, then click Generate per entity to produce reference images on your ComfyUI. Regenerate any single entity without touching the others.
 - **Script:** **Regenerate Script** also opens a project-linked Agents chat (pre-filled) to rewrite the per-scene script. Scenes link back to the characters and locations from the Story stage.
-- **Video:** each scene gets a **Generate** button that queues a clip job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs). Import a FirstMotion + NextMotion H3 pair to chain clips: clip 1 starts a motion, clips 2+ continue the last 22 frames and 1s of audio from the previous latent so the export stitch reads as one long take.
-- **Film view:** once scenes have clips, **Export film** stitches them with ffmpeg: every clip is normalized to 1080p30, joined with 0.5s crossfades, and loudness-normalized into one final file.
+- **Video:** each scene gets a **Generate** button that queues a clip job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs). Scenes marked **Continue from previous video** in Script extend the previous clip instead of cutting fresh — see [Continue from previous clip (video extend)](#continue-from-previous-clip-video-extend).
+- **Film view:** once scenes have clips, **Export film** stitches them with ffmpeg: clips are normalized to 1080p at the **majority frame rate of the clips themselves** (24 fps clips export at 24 fps; mixed-rate projects conform to whichever rate most clips use), joined with 0.5s crossfades, and loudness-normalized into one final file.
 - When everything is done the project is automatically marked **Completed**.
 
 **Playground** is a free-form generation page outside the project pipeline: run any imported workflow with arbitrary inputs, upload your own files (image / video / audio) as inputs, and optionally attach a result to a project as an asset.
@@ -135,7 +124,6 @@ Input roles:
 | `image` | `img` | Generic image input (ordered ref slot — see below) |
 | `video` | `vid` | Video file input (`LoadVideo`) |
 | `audio` | `sound`, `sfx` | Audio file input (`LoadAudio`) |
-| `clipindex` | `clip_index` | H3 Motion Context Primitive INT (`Load` / `Save` in the title) |
 | `seed` | — | Shared form |
 | `duration` | `dur`, `length`, `seconds` | Scene duration (video jobs) |
 
@@ -159,6 +147,39 @@ For multi-reference workflows, generic `(Input:image)` inputs are filled in **no
 - **Text Prompt — leave it empty.** An empty field gets the LLM-rewritten six-section H3 prompt built from the scene's action, dialogue, characters, and location. If you type anything, your text is sent verbatim and the model receives plain prose instead of the H3 format.
 - **Ref 1 / Ref 2 — leave them on "Choose asset…"** to auto-fill from the scene's characters (in scene order) then the location, with `<Subject N>` numbering matched to those slots. Picking an asset manually overrides just that slot (and you take over subject numbering for it).
 - **Duration** auto-fills from the scene's estimated duration; edit it only when you want a different clip length.
+
+### Continue from previous clip (video extend)
+
+Long takes don't have to be one giant generation. Mark a scene **Continue from previous video** in the **Script** stage and instead of cutting a fresh clip, it extends the previous scene's clip as real continuation footage (the first scene can't use the toggle).
+
+The **Video** stage enforces one requirement: the scene's workflow must have an input tagged `(Input:video)` (a `LoadVideo` node). Continue scenes on a workflow without one have Generate disabled with a warning.
+
+When the workflow qualifies, a **clip source picker** appears on the continue scene:
+
+- **Auto** (default) — the previous scene's clip is used, resolved when the job actually runs.
+- **Upload file** — extend from any video you provide (a Playground upload).
+- **From timeline** — pick a specific earlier scene's clip explicitly.
+
+Auto is safe even when scenes are queued in one batch: Calliope's queue renders one job at a time, so by the time a continue scene runs, the scene before it has already rendered and its clip is picked up automatically.
+
+The workflow pattern (per [kat3ri/ComfyUI-MiniMax-H3-Extend](https://github.com/kat3ri/ComfyUI-MiniMax-H3-Extend)) is a `LoadVideo (Input:video)` node feeding the MiniMax H3 extend patched nodes (`MiniMaxH3EncodeAVPatched` → `MiniMaxH3VideoExtendPatched`) with the `(Output:video)` node at the end. Recommended starting settings from that repo: `context_frames` **2**, `ref_spacing` **1–2**, `ref_decay` **0.3**, `ref_ramp` **3–4** (5–6 if the prior clip had heavy motion).
+
+### Review the prompt before you generate
+
+Generate no longer fires blind. Hitting **Generate clip** first opens a prompt preview: the exact text that will land on the workflow's `(Input:prompt)` node — your saved draft if there is one, otherwise a fresh MiniMax H3 rewrite (six-section format) or the prose scene prompt.
+
+- **Edit it inline** — typos, camera notes, pacing, anything. The edited text is what gets sent.
+- **Regenerate** re-runs the H3 rewrite for a different take.
+- **Save draft** keeps it on the scene; future generates (single or **Generate all**) reuse the draft instead of calling the LLM again. A hint appears when the draft predates changes to the scene.
+- **Cancel** aborts with nothing enqueued.
+
+After a render, **View prompt & inputs** opens the scene's render history: every job as a chip, the payload each one actually sent to ComfyUI, and **Copy settings to form** to pull a past job's input values back into the live form.
+
+Your video-stage setup (workflow choice, input values, clip source) auto-saves per scene and comes back after a reload or app restart. **Generate all** honors every scene's saved setup and drafts — the toast reports how many drafts were used.
+
+### Better ComfyUI errors
+
+When ComfyUI rejects a workflow, the job error now names the actual cause and node — e.g. `ComfyUI rejected the workflow (400): prompt_outputs_failed_validation; node 12: Invalid audio file: "voice.m4a"` — instead of a bare status code. Audio reference inputs upload to ComfyUI's flat input directory and work with both stock `LoadAudio` and VHS's `VHS_LoadAudio`.
 
 ### 3. Export the workflow
 
@@ -194,4 +215,3 @@ example_ComfyUI_workflows/   ready-to-import API-format workflow JSONs
 docs/wiki/                   design notes (wiki source): ComfyUI HTTP vs MCP, multi-ref workflows
 ```
 
-The Windows desktop app is built from this repo but not shipped in it — download it from the [Releases](../../releases) page.

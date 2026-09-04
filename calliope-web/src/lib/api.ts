@@ -74,6 +74,14 @@ export interface StoryData {
 	items: Item[];
 }
 
+export interface LlmProfile {
+	id: string;
+	name: string;
+	base_url: string;
+	model: string;
+	api_key: boolean;
+}
+
 export interface Settings {
 	host: string;
 	port: number;
@@ -83,6 +91,8 @@ export interface Settings {
 	llm_base_url: string;
 	llm_model: string;
 	llm_api_key: boolean;
+	llm_profiles: LlmProfile[];
+	llm_active_id: string | null;
 	comfyui_base_url: string;
 	queue_concurrency: number;
 	queue_poll_interval_sec: number;
@@ -90,11 +100,19 @@ export interface Settings {
 	queue_max_retries: number;
 	agent_max_steps: number;
 	agent_hardening_prompt: string;
+	agent_llm_assignments: Record<string, string | null>;
 	dry_run: boolean;
 }
 
-import type { Job, Scene, Workflow, ComfyDynamicInput, ComfyDynamicOutput } from './comfy/types';
-export type { Job, Scene, Workflow, ComfyDynamicInput, ComfyDynamicOutput };
+import type {
+	Job,
+	Scene,
+	SceneVideoSettings,
+	Workflow,
+	ComfyDynamicInput,
+	ComfyDynamicOutput,
+} from './comfy/types';
+export type { Job, Scene, SceneVideoSettings, Workflow, ComfyDynamicInput, ComfyDynamicOutput };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(`${API_BASE}${path}`, {
@@ -224,7 +242,6 @@ export const workflows = {
 			inputs: ComfyDynamicInput[];
 			outputs: ComfyDynamicOutput[];
 			suggested_profile?: string;
-			motion_role?: 'first' | 'next' | null;
 		}>('/api/workflows/analyze', {
 			method: 'POST',
 			body: JSON.stringify({ workflow_json }),
@@ -264,10 +281,23 @@ export const jobsApi = {
 			scene_ids?: number[];
 			workflow_id?: number;
 			input_values?: Record<string, unknown>;
-			continue_motion?: boolean;
+			prompts?: Record<string, string>;
 		} = {},
 	) =>
 		api<{ ok: boolean; jobs: Job[] }>(`/api/jobs/projects/${projectId}/generate-videos`, {
+			method: 'POST',
+			body: JSON.stringify(payload),
+		}),
+	previewPrompt: (
+		projectId: number,
+		payload: { scene_id: number; workflow_id?: number },
+	) =>
+		api<{
+			prompt: string;
+			profile: string;
+			from_draft: boolean;
+			based_on: string;
+		}>(`/api/jobs/projects/${projectId}/preview-prompt`, {
 			method: 'POST',
 			body: JSON.stringify(payload),
 		}),
