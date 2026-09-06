@@ -18,6 +18,7 @@ from calliope.queue.worker import queue_worker
 from calliope.routers import (
     agent,
     assets,
+    canvas,
     events,
     jobs,
     playground,
@@ -110,7 +111,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
-    app = FastAPI(title="Calliope", version="1.2.1", lifespan=lifespan)
+    app = FastAPI(title="Calliope", version="1.4.0", lifespan=lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -128,12 +129,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     app.include_router(workflows.router, prefix="/api/workflows", tags=["workflows"])
     app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
     app.include_router(playground.router, prefix="/api/playground", tags=["playground"])
+    app.include_router(canvas.router, prefix="/api/canvas", tags=["canvas"])
     app.include_router(agent.router, prefix="/api/agent", tags=["agent"])
     app.include_router(events.router, prefix="/api/events", tags=["events"])
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"status": "ok", "version": "1.2.1", "dry_run": settings.dry_run}
+        return {"status": "ok", "version": "1.4.0", "dry_run": settings.dry_run}
 
     # Catch unknown /api/* before StaticFiles — otherwise POST falls through and
     # returns a confusing 405 Method Not Allowed from the file server.

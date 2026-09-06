@@ -1,0 +1,13 @@
+/* Canvas v2.1 scoped visual tokens (spec v2.0 §2) — canvas surfaces only.
+   The global --accent stays untouched for v1 pages. */
+.canvas-root {
+	--accent: #4f46a5;
+	--accent-hover: #6157c9;
+	--accent-glow: rgba(99, 102, 241, 0.3);
+	--edge: #7dd3fc;
+	/* Edge-chip surfaces (LinkEdge label) — fallbacks match the dark theme. */
+	--panel: #17171f;
+	--panel-border: #2a2a35;
+	--fg: #f4f4f5;
+	--fg-dim: #a1a1aa;
+}
