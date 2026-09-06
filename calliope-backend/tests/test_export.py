@@ -43,7 +43,7 @@ def test_build_ffmpeg_cmd_two_clips():
     assert "scale=1920:1080:force_original_aspect_ratio=decrease" in joined
     assert "fps=30" in joined
     assert "-c:v libx264" in joined
-    assert "-crf 20" in joined
+    assert "-crf 18" in joined
     assert "-b:a 192k" in joined
     assert "-movflags +faststart" in joined
     assert "-progress pipe:1" in joined

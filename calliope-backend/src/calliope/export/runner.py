@@ -223,7 +223,7 @@ def build_ffmpeg_cmd(
         "-preset",
         "medium",
         "-crf",
-        "20",
+        "18",
         "-c:a",
         "aac",
         "-b:a",
