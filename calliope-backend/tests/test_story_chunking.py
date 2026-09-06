@@ -22,7 +22,7 @@ def fake_llm(monkeypatch):
     from the user prompt and returns exactly that many beats."""
     calls: list[dict] = []
 
-    async def fake(messages, temperature=0.7):
+    async def fake(messages, temperature=0.7, **_kw):  # local salvage kwargs
         user = messages[1]["content"]
         chunk_n = 0
         start = 1
