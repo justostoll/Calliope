@@ -250,3 +250,49 @@ def test_ask_user_logs_tool_result_before_turn_end(client, session):
     assert tr.data["result"]["question"] == "Regenerate the script?"
     end = events[end_idx]
     assert end.data["status"] == "awaiting_input", end.data
+
+
+
+def test_live_message_echo_carries_parsed_tool_result(client, session, monkeypatch):
+    """The agent.message SSE echo for an ask_user tool row must carry the
+    parsed `tool_result` (question/options/scope) the way GET /sessions/{id}
+    does — AgentChat derives the question card from it, so a raw row with only
+    tool_result_json rendered no card until the page was reloaded."""
+    import asyncio
+
+    from calliope.agent.harness.runner import AgentRunner
+    from calliope.events.bus import event_bus
+
+    published: list[tuple[str, dict]] = []
+
+    async def capture(event_type, data):
+        published.append((event_type, data))
+
+    monkeypatch.setattr(event_bus, "publish", capture)
+    sink = AgentRunner()._make_message_sink(session["id"])
+    result = {
+        "ok": True,
+        "awaiting_user_input": True,
+        "question_seq": 7,
+        "question": "Render now?",
+        "options": ["Yes, render", "No, not yet"],
+        "scope": "render",
+    }
+    asyncio.run(
+        sink(
+            {
+                "role": "tool",
+                "tool_name": "ask_user",
+                "tool_args": {"question": "Render now?"},
+                "tool_result": result,
+            }
+        )
+    )
+
+    echoes = [d["message"] for t, d in published if t == "agent.message"]
+    assert len(echoes) == 1
+    msg = echoes[0]
+    assert msg["tool_name"] == "ask_user"
+    assert msg["tool_result"] == result
+    assert msg["tool_args"] == {"question": "Render now?"}
+    assert isinstance(msg["tool_result_json"], str)  # raw keys still present

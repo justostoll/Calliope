@@ -117,7 +117,16 @@ class AgentRunner:
             row = conn.execute(
                 "SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)
             ).fetchone()
-            return row_to_dict(row)
+            out = row_to_dict(row)
+            # The SSE echo of this row is what a connected client appends to
+            # its chat without a refetch. GET /sessions/{id} hands clients
+            # parsed `tool_args` / `tool_result`; the raw row only has the
+            # *_json strings, so a live ask_user row carried no `tool_result`
+            # and the question card only appeared after a reload. Ship the
+            # parsed values too (the *_json keys stay for compatibility).
+            out["tool_args"] = tool_args if tool_args else None
+            out["tool_result"] = tool_result
+            return out
         finally:
             conn.close()
 
