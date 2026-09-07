@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from calliope.agent.harness import (
+    GUARD_DESTRUCTIVE_REPLACE,
     _destructive_guard,
     _is_render_request,
     _render_approval_guard,
@@ -236,6 +237,95 @@ def test_destructive_guard_blocks_non_confirming_request(client):
     )
     assert out["ok"] is False
     assert "blocked:" in out["error"]
+
+
+def _row_delete_registry() -> ToolRegistry:
+    """A registry with a delete_beat stub (no replace param) + the real guard."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="delete_beat",
+            description="row delete stub",
+            parameters={"type": "object", "properties": {"beat_id": {"type": "integer"}}},
+            executor=_noop_executor,
+            destructive=True,
+        )
+    )
+    reg.on_pre_execute(_destructive_guard)
+    return reg
+
+
+def _log_delete_calls(sid: int, turn: int, n: int) -> None:
+    for i in range(n):
+        session_log.append_event(
+            sid,
+            session_log.TOOL_CALL,
+            {"turn": turn, "step": i + 1, "call_id": f"c{i}", "tool_name": "delete_beat"},
+        )
+
+
+def test_bulk_row_delete_blocked_without_confirmation(client):
+    """The Nth delete_beat in one unconfirmed turn is refused with the
+    destructive-replace code; the first N-1 stay allowed (targeted edits)."""
+    from calliope.agent.harness import BULK_ROW_DELETES_PER_TURN
+
+    pid = _mk_project(client, "Row Delete Film")
+    sid = _mk_session(pid)
+    session_log.append_event(sid, session_log.USER_MESSAGE, {"content": "make the story darker"})
+    session_log.append_event(sid, session_log.TURN_START, {"turn": 1})
+    reg = _row_delete_registry()
+    ctx = ToolContext(session_id=sid, project_id=pid)
+
+    # The loop logs tool/call before the guard runs — mirror that here.
+    _log_delete_calls(sid, 1, BULK_ROW_DELETES_PER_TURN - 1)
+    out = asyncio.run(reg.execute(ctx, "delete_beat", {"beat_id": 1}))
+    assert out["ok"] is True
+
+    _log_delete_calls(sid, 1, 1)
+    out = asyncio.run(reg.execute(ctx, "delete_beat", {"beat_id": 2}))
+    assert out["ok"] is False
+    assert out.get("reason_code") == GUARD_DESTRUCTIVE_REPLACE or "blocked:" in out["error"]
+    assert "row by row" in out["error"]
+
+
+def test_bulk_row_delete_allowed_when_user_asked_to_regenerate(client):
+    """An explicit regenerate/replace request in the latest user message keeps
+    row-by-row deletion allowed — the user asked for the board to go."""
+    from calliope.agent.harness import BULK_ROW_DELETES_PER_TURN
+
+    pid = _mk_project(client, "Row Delete Film 2")
+    sid = _mk_session(pid)
+    session_log.append_event(
+        sid, session_log.USER_MESSAGE, {"content": "Regenerate the storyline from scratch, darker."}
+    )
+    session_log.append_event(sid, session_log.TURN_START, {"turn": 1})
+    _log_delete_calls(sid, 1, BULK_ROW_DELETES_PER_TURN + 5)
+    out = asyncio.run(
+        _row_delete_registry().execute(
+            ToolContext(session_id=sid, project_id=pid), "delete_beat", {"beat_id": 9}
+        )
+    )
+    assert out["ok"] is True
+
+
+def test_bulk_row_delete_counter_resets_per_turn(client):
+    """Deletes in an earlier turn do not count against the current one."""
+    from calliope.agent.harness import BULK_ROW_DELETES_PER_TURN
+
+    pid = _mk_project(client, "Row Delete Film 3")
+    sid = _mk_session(pid)
+    session_log.append_event(sid, session_log.USER_MESSAGE, {"content": "tighten act two"})
+    session_log.append_event(sid, session_log.TURN_START, {"turn": 1})
+    _log_delete_calls(sid, 1, BULK_ROW_DELETES_PER_TURN + 2)
+    session_log.append_event(sid, session_log.USER_MESSAGE, {"content": "and trim the ending"})
+    session_log.append_event(sid, session_log.TURN_START, {"turn": 2})
+    _log_delete_calls(sid, 2, 1)
+    out = asyncio.run(
+        _row_delete_registry().execute(
+            ToolContext(session_id=sid, project_id=pid), "delete_beat", {"beat_id": 3}
+        )
+    )
+    assert out["ok"] is True
 
 
 def test_destructive_guard_negation_still_blocks(client):

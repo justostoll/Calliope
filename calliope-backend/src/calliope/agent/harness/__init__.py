@@ -77,6 +77,53 @@ def _render_approval_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> P
     )
 
 
+# Row-by-row tools that can reassemble a full replace without ever touching a
+# `replace` parameter. Observed live 2026-09-07 (session 157): asked to redo the
+# storyline, the agent called delete_beat 20 times and add_beat 8 times and
+# never met _destructive_guard. The Nth such call in ONE unconfirmed turn is
+# refused; the first N-1 stay free for genuine targeted edits.
+BULK_ROW_DELETE_TOOLS = frozenset({"delete_beat"})
+BULK_ROW_DELETES_PER_TURN = 3
+
+
+def _row_deletes_this_turn(session_id: int, tool_name: str) -> int:
+    """tool/call events for `tool_name` in the session's current turn. The
+    loop logs tool/call BEFORE pre-execute hooks run, so the count includes
+    the call being guarded (and any earlier denied ones, which also stay
+    counted — a refused delete is still an attempt at bulk deletion)."""
+    from calliope.agent.harness import log as session_log
+
+    turn = session_log.max_turn_number(session_id)
+    n = 0
+    for ev in session_log.read_events(session_id):
+        if ev.type != session_log.TOOL_CALL:
+            continue
+        if ev.data.get("tool_name") != tool_name:
+            continue
+        if int(ev.data.get("turn") or 0) != turn:
+            continue
+        n += 1
+    return n
+
+
+def _bulk_row_delete_guard(ctx: ToolContext, t: ToolDefinition) -> PreExecuteDecision:
+    if ctx.project_id is None:
+        return allow()
+    n = _row_deletes_this_turn(ctx.session_id, t.name)
+    if n < BULK_ROW_DELETES_PER_TURN:
+        return allow()
+    if _user_confirmed_replacement(ctx):
+        return allow()
+    return deny(
+        f"This is {t.name} call #{n} in the current turn — deleting the board row by row "
+        "is a replace, and the user has not asked for one. Stop deleting. Either ask the "
+        "user with ask_user(scope=\"destructive_replace\") and wait for the answer, or — "
+        "once they have confirmed (e.g. 'yes, replace it') — call generate_story / "
+        "generate_script with replace=true, which rewrites the board in one step.",
+        code=GUARD_DESTRUCTIVE_REPLACE,
+    )
+
+
 def _destructive_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> PreExecuteDecision:
     """Block silent destructive *regeneration* unless the user asked for it.
 
@@ -91,6 +138,8 @@ def _destructive_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> PreEx
     """
     if not t.destructive:
         return allow()
+    if t.name in BULK_ROW_DELETE_TOOLS:
+        return _bulk_row_delete_guard(ctx, t)
     has_replace_param = "replace" in t.parameters.get("properties", {})
     if not has_replace_param:
         return allow()
