@@ -112,7 +112,14 @@ def append_event(session_id: int, event_type: str, data: dict[str, Any]) -> Sess
             """,
             (session_id, session_id, event_type, json.dumps(data, ensure_ascii=False, default=str)),
         )
-        seq = cur.lastrowid
+        # cur.lastrowid is the table-wide row id, NOT the per-session seq the
+        # INSERT just allocated; read the seq back. Returning the row id made
+        # ask_user hand the card a question_seq that latest_open_question()
+        # (which compares per-session seq) could never match, so a card click
+        # never wrote question/answered once more than one session existed.
+        seq = conn.execute(
+            "SELECT seq FROM agent_events WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()["seq"]
         conn.execute(
             "UPDATE agent_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (session_id,),
