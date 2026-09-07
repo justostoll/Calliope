@@ -250,3 +250,54 @@ def test_ask_user_logs_tool_result_before_turn_end(client, session):
     assert tr.data["result"]["question"] == "Regenerate the script?"
     end = events[end_idx]
     assert end.data["status"] == "awaiting_input", end.data
+
+
+def test_append_event_returns_per_session_seq(client, session):
+    """append_event must return the per-session seq it allocated, not the
+    table-wide row id. Once any other session has events the two diverge, and
+    ask_user's question_seq (taken from the returned event) must still match
+    what read_events / latest_open_question report for the same row."""
+    other = client.post("/api/agent/sessions", json={}).json()
+    for i in range(3):
+        session_log.append_event(other["id"], "assistant/message", {"content": f"noise {i}"})
+
+    ev = session_log.append_event(
+        session["id"],
+        session_log.QUESTION_ASKED,
+        {"question": "q?", "options": ["a", "b"], "scope": "info"},
+    )
+    events = session_log.read_events(session["id"])
+    stored = [e for e in events if e.type == session_log.QUESTION_ASKED]
+    assert len(stored) == 1
+    assert ev.seq == stored[0].seq
+    assert interaction.latest_open_question(session["id"])["seq"] == ev.seq
+
+
+def test_card_answer_matches_question_when_other_sessions_exist(client, session):
+    """The card click flow end to end with a second, busier session in the
+    table: question_seq handed to the card must still record question/answered."""
+    import asyncio
+
+    other = client.post("/api/agent/sessions", json={}).json()
+    for i in range(5):
+        session_log.append_event(other["id"], "assistant/message", {"content": f"noise {i}"})
+
+    ctx = ToolContext(session_id=session["id"], project_id=None)
+    asked = asyncio.run(
+        execute_tool(
+            ctx,
+            "ask_user",
+            {"question": "Render now?", "options": ["Yes", "No"], "scope": "render"},
+        )
+    )
+    resp = client.post(
+        f"/api/agent/sessions/{session['id']}/messages",
+        json={"content": "Yes", "answer_to": asked["question_seq"]},
+    )
+    assert resp.status_code == 200, resp.text
+    events = session_log.read_events(session["id"])
+    answered = [e for e in events if e.type == session_log.QUESTION_ANSWERED]
+    assert len(answered) == 1
+    assert answered[0].data["question_seq"] == asked["question_seq"]
+    assert policy.has_structured_approval(ctx, "render") is True
+
