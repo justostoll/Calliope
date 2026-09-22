@@ -36,8 +36,6 @@ calliope-backend/src/calliope/static/
 # Electron shell was dropped — keep ignoring so a leftover folder cannot be committed.
 electron/
 AGENTS.md
-start.bat
-end.bat
 ScreenShots/
 docs/*
 !docs/changelogs/
@@ -45,3 +43,6 @@ docs/*
 prototype/
 2026-*.md
 !docs/changelogs/*.md
+
+# --- Reference clones (vendored for porting only) ---
+reference/

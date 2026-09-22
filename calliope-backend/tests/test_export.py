@@ -7,6 +7,31 @@ import pytest
 
 from calliope.comfyui.client import ComfyUIClient
 from calliope.export.runner import DEFAULT_EXPORT_FPS, build_ffmpeg_cmd, collect_clips, parse_rate, target_fps
+from calliope.config import settings
+from calliope.db import get_db
+
+
+def _set_clip_path(clip_id: int, path: str) -> None:
+    conn = get_db(settings.db_path)
+    try:
+        conn.execute("UPDATE clips SET clip_path = ? WHERE id = ?", (path, clip_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _scene_default_clip(pid: int, scene_id: int) -> int:
+    conn = get_db(settings.db_path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM clips WHERE scene_id = ? AND project_id = ? "
+            "ORDER BY order_index, id LIMIT 1",
+            (scene_id, pid),
+        ).fetchone()
+        assert row is not None
+        return row["id"]
+    finally:
+        conn.close()
 
 
 def _make_project_with_clips(client, title: str = "My Film") -> int:
@@ -17,17 +42,13 @@ def _make_project_with_clips(client, title: str = "My Film") -> int:
     s2 = client.post(
         f"/api/projects/{pid}/scenes", json={"order_index": 2, "heading": "Chase"}
     ).json()
-    client.patch(
-        f"/api/projects/{pid}/scenes/{s1['id']}", json={"video_path": "C:/clips/a.mp4"}
-    )
-    client.patch(
-        f"/api/projects/{pid}/scenes/{s2['id']}", json={"video_path": "C:/clips/b.mp4"}
-    )
+    _set_clip_path(_scene_default_clip(pid, s1["id"]), "C:/clips/a.mp4")
+    _set_clip_path(_scene_default_clip(pid, s2["id"]), "C:/clips/b.mp4")
     return pid
 
 
 def test_build_ffmpeg_cmd_two_clips():
-    clips = [{"video_path": "a.mp4"}, {"video_path": "b.mp4"}]
+    clips = [{"clip_path": "a.mp4"}, {"clip_path": "b.mp4"}]
     probes = [
         {"duration": 8.02, "has_audio": True},
         {"duration": 8.0, "has_audio": True},
@@ -52,7 +73,7 @@ def test_build_ffmpeg_cmd_two_clips():
 
 
 def test_build_ffmpeg_cmd_anullsrc_for_silent_clip():
-    clips = [{"video_path": "a.mp4"}, {"video_path": "b.mp4"}]
+    clips = [{"clip_path": "a.mp4"}, {"clip_path": "b.mp4"}]
     probes = [
         {"duration": 8.0, "has_audio": True},
         {"duration": 4.0, "has_audio": False},
@@ -72,7 +93,7 @@ def test_build_ffmpeg_cmd_anullsrc_for_silent_clip():
 
 def test_build_ffmpeg_cmd_single_clip():
     cmd = build_ffmpeg_cmd(
-        [{"video_path": "a.mp4"}], [{"duration": 5.0, "has_audio": True}], "out.mp4"
+        [{"clip_path": "a.mp4"}], [{"duration": 5.0, "has_audio": True}], "out.mp4"
     )
     joined = " ".join(str(c) for c in cmd)
     assert "xfade" not in joined
@@ -96,8 +117,8 @@ def test_collect_clips_split_and_order(client):
         f"/api/projects/{pid}/scenes", json={"order_index": 1, "heading": "A"}
     ).json()
     client.post(f"/api/projects/{pid}/scenes", json={"order_index": 3, "heading": "C"})
-    client.patch(f"/api/projects/{pid}/scenes/{s_b['id']}", json={"video_path": "b.mp4"})
-    client.patch(f"/api/projects/{pid}/scenes/{s_a['id']}", json={"video_path": "a.mp4"})
+    _set_clip_path(_scene_default_clip(pid, s_b["id"]), "b.mp4")
+    _set_clip_path(_scene_default_clip(pid, s_a["id"]), "a.mp4")
 
     clips, skipped = collect_clips(pid)
     assert [c["heading"] for c in clips] == ["A", "B"]
@@ -235,7 +256,7 @@ def test_target_fps_missing_falls_back_to_default():
 
 
 def test_build_ffmpeg_cmd_explicit_fps_24():
-    clips = [{"video_path": "a.mp4"}]
+    clips = [{"clip_path": "a.mp4"}]
     probes = [{"duration": 5.0, "has_audio": True, "fps": 30.0}]
     cmd = build_ffmpeg_cmd(clips, probes, "out.mp4", fps=24.0)
     joined = " ".join(str(c) for c in cmd)
@@ -244,7 +265,7 @@ def test_build_ffmpeg_cmd_explicit_fps_24():
 
 
 def test_build_ffmpeg_cmd_defaults_to_target_fps_vote():
-    clips = [{"video_path": "a.mp4"}, {"video_path": "b.mp4"}]
+    clips = [{"clip_path": "a.mp4"}, {"clip_path": "b.mp4"}]
     probes = [
         {"duration": 5.0, "has_audio": True, "fps": 24.0},
         {"duration": 5.0, "has_audio": True, "fps": 24.0},
@@ -256,7 +277,7 @@ def test_build_ffmpeg_cmd_defaults_to_target_fps_vote():
 
 
 def test_build_ffmpeg_cmd_fractional_fps_formatting():
-    clips = [{"video_path": "a.mp4"}]
+    clips = [{"clip_path": "a.mp4"}]
     probes = [{"duration": 5.0, "has_audio": True, "fps": 23.976023976}]
     # Explicit fractional rate: target_fps votes on rounded fps (24), so :.6g
     # formatting is only reachable via the explicit override.

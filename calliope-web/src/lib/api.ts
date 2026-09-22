@@ -1,4 +1,5 @@
 import type { AgentComposerPayload } from '$lib/agentComposer';
+import { t } from '$lib/i18n.svelte';
 
 const API_BASE = '';
 
@@ -108,11 +109,12 @@ import type {
 	Job,
 	Scene,
 	SceneVideoSettings,
+	Clip,
 	Workflow,
 	ComfyDynamicInput,
 	ComfyDynamicOutput,
 } from './comfy/types';
-export type { Job, Scene, SceneVideoSettings, Workflow, ComfyDynamicInput, ComfyDynamicOutput };
+export type { Job, Scene, SceneVideoSettings, Clip, Workflow, ComfyDynamicInput, ComfyDynamicOutput };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(`${API_BASE}${path}`, {
@@ -123,7 +125,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 		},
 	});
 	if (!res.ok) {
-		const body = await res.text().catch(() => 'unknown error');
+		const body = await res.text().catch(() => t('api.unknownError'));
 		throw new Error(`${res.status}: ${body}`);
 	}
 	return res.json() as Promise<T>;
@@ -133,7 +135,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 async function apiUpload<T>(path: string, form: FormData): Promise<T> {
 	const res = await fetch(`${API_BASE}${path}`, { method: 'POST', body: form });
 	if (!res.ok) {
-		const body = await res.text().catch(() => 'unknown error');
+		const body = await res.text().catch(() => t('api.unknownError'));
 		throw new Error(`${res.status}: ${body}`);
 	}
 	return res.json() as Promise<T>;
@@ -205,6 +207,35 @@ export const projects = {
 		api<{ scenes: Scene[] }>(`/api/projects/${projectId}/scenes/reorder`, {
 			method: 'POST',
 			body: JSON.stringify({ scene_ids: sceneIds }),
+		}),
+	createClip: (projectId: number, sceneId: number, payload: Record<string, unknown>) =>
+		api<Clip>(`/api/projects/${projectId}/scenes/${sceneId}/clips`, {
+			method: 'POST',
+			body: JSON.stringify(payload),
+		}),
+	updateClip: (projectId: number, clipId: number, payload: Record<string, unknown>) =>
+		api<Clip>(`/api/projects/${projectId}/clips/${clipId}`, {
+			method: 'PATCH',
+			body: JSON.stringify(payload),
+		}),
+	deleteClip: (projectId: number, clipId: number) =>
+		api<{ ok: boolean }>(`/api/projects/${projectId}/clips/${clipId}`, { method: 'DELETE' }),
+	reorderClips: (projectId: number, sceneId: number, clipIds: number[]) =>
+		api<{ ok: boolean }>(`/api/projects/${projectId}/scenes/${sceneId}/clips/reorder`, {
+			method: 'POST',
+			body: JSON.stringify({ clip_ids: clipIds }),
+		}),
+	expandClips: (
+		projectId: number,
+		payload: { scene_ids?: number[]; all?: boolean; guidance?: string } = {},
+	) =>
+		api<{
+			ok: boolean;
+			scenes: Array<{ scene_id: number; clip_count: number; total_duration_sec: number }>;
+			total_clips: number;
+		}>(`/api/projects/${projectId}/expand-clips`, {
+			method: 'POST',
+			body: JSON.stringify(payload),
 		}),
 	generateAssets: (
 		id: number,
@@ -281,6 +312,7 @@ export const jobsApi = {
 		projectId: number,
 		payload: {
 			scene_ids?: number[];
+			clip_ids?: number[];
 			workflow_id?: number;
 			input_values?: Record<string, unknown>;
 			prompts?: Record<string, string>;
@@ -292,7 +324,7 @@ export const jobsApi = {
 		}),
 	previewPrompt: (
 		projectId: number,
-		payload: { scene_id: number; workflow_id?: number },
+		payload: { clip_id?: number; scene_id?: number; workflow_id?: number },
 	) =>
 		api<{
 			prompt: string;
@@ -309,7 +341,7 @@ export const jobsApi = {
 
 export type PlaygroundAttachTarget = 'character_sheet' | 'location' | 'item' | 'scene';
 
-export type UploadKind = 'image' | 'video' | 'audio';
+export type UploadKind = 'image' | 'video' | 'audio' | 'document';
 
 export interface PlaygroundUpload {
 	ok: boolean;
@@ -361,6 +393,32 @@ export const playgroundApi = {
 		),
 };
 
+// ── Asset Library (unlinked Playground media) ───────────────────────────
+
+export interface LibraryMediaItem {
+	path: string;
+	name: string;
+	kind: 'image' | 'video';
+	size: number;
+	mtime: string;
+}
+
+export interface LibraryDeleteResult {
+	path: string;
+	status: 'deleted' | 'kept';
+	reason?: string;
+}
+
+export const libraryApi = {
+	list: () => api<LibraryMediaItem[]>('/api/library/media'),
+	deleteMany: (paths: string[]) =>
+		api<{
+			ok: boolean;
+			deleted: string[];
+			results: LibraryDeleteResult[];
+		}>('/api/library/media', { method: 'DELETE', body: JSON.stringify({ paths }) }),
+};
+
 // ── Agents (agentic harness) ────────────────────────────────────────────
 
 export interface AgentSession {
@@ -368,6 +426,8 @@ export interface AgentSession {
 	project_id: number | null;
 	title: string;
 	status: 'idle' | 'running' | 'error';
+	/** WHERE the session was born: 'chat' (AI Canvas) or 'scene' (Build Scene rail). */
+	origin: 'chat' | 'scene';
 	created_at: string;
 	updated_at: string;
 	running?: boolean;
@@ -393,7 +453,7 @@ export interface AgentMessage {
 export interface AgentTask {
 	role: string;
 	goal: string;
-	status: 'pending' | 'running' | 'done' | 'failed';
+	status: 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 	index?: number;
 }
 
@@ -407,9 +467,10 @@ export const agentApi = {
 		api<AgentSession[]>(
 			`/api/agent/sessions${projectId != null ? `?project_id=${projectId}` : ''}`,
 		),
+	listSceneSessions: () => api<AgentSession[]>('/api/agent/sessions?origin=scene'),
 	listLinkableProjects: () =>
 		api<{ id: number; title: string; status: string }[]>('/api/agent/projects'),
-	createSession: (payload: { title?: string; project_id?: number | null }) =>
+	createSession: (payload: { title?: string; project_id?: number | null; origin?: 'chat' | 'scene' }) =>
 		api<AgentSession>('/api/agent/sessions', {
 			method: 'POST',
 			body: JSON.stringify(payload),
@@ -433,7 +494,7 @@ export const agentApi = {
 			typeof payload === 'string'
 				? { content: payload, mentions: [], attachments: [] }
 				: payload;
-		return api<{ ok: boolean; message: AgentMessage }>(`/api/agent/sessions/${id}/messages`, {
+		return api<{ ok: boolean; steered?: boolean; message: AgentMessage }>(`/api/agent/sessions/${id}/messages`, {
 			method: 'POST',
 			body: JSON.stringify(body),
 		});
@@ -581,7 +642,10 @@ export const canvasApi = {
 			body: JSON.stringify(payload),
 		}),
 	deleteNode: (canvasId: number, nodeId: number) =>
-		api<{ ok: boolean }>(`/api/canvas/${canvasId}/nodes/${nodeId}`, { method: 'DELETE' }),
+		api<{ ok: boolean; file_deleted?: boolean; reason?: string | null }>(
+			`/api/canvas/${canvasId}/nodes/${nodeId}`,
+			{ method: 'DELETE' },
+		),
 	tidy: (canvasId: number) =>
 		api<{ ok: boolean; moved: number }>(`/api/canvas/${canvasId}/tidy`, { method: 'POST' }),
 	createEdge: (

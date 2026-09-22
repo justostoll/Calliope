@@ -118,14 +118,24 @@ class AgentRunner:
                 "SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)
             ).fetchone()
             out = row_to_dict(row)
-            # The SSE echo of this row is what a connected client appends to
-            # its chat without a refetch. GET /sessions/{id} hands clients
-            # parsed `tool_args` / `tool_result`; the raw row only has the
-            # *_json strings, so a live ask_user row carried no `tool_result`
-            # and the question card only appeared after a reload. Ship the
-            # parsed values too (the *_json keys stay for compatibility).
-            out["tool_args"] = tool_args if tool_args else None
-            out["tool_result"] = tool_result
+            # Echo the parsed shapes alongside the raw *_json strings, so the
+            # live agent.message SSE row has the same shape as GET
+            # /sessions/{id} rows (which derive from the parsed event log).
+            # AgentChat derives the ask_user question card from
+            # tool_result.options — raw-string rows made the card invisible
+            # until a page reload (PR #49).
+            if out.get("tool_args_json"):
+                try:
+                    out["tool_args"] = json.loads(out["tool_args_json"])
+                except (json.JSONDecodeError, TypeError):
+                    out["tool_args"] = None
+            if out.get("tool_result_json"):
+                try:
+                    out["tool_result"] = json.loads(
+                        out["tool_result_json"], strict=False
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    out["tool_result"] = None
             return out
         finally:
             conn.close()
@@ -169,6 +179,34 @@ class AgentRunner:
     def is_running(self, session_id: int) -> bool:
         task = self._tasks.get(session_id)
         return task is not None and not task.done()
+
+    def recover_orphaned_sessions(self) -> int:
+        """Reset sessions stuck in ``running`` at startup.
+
+        A crashed or killed process never reaches the loop's ``turn/end``
+        (its finally-block died with it), so those rows stay ``running``
+        forever — the UI shows a phantom "Working…" state with a dead Stop
+        button and the session looks unresumable. At startup no tasks exist
+        yet, so every ``running`` row is orphaned by definition. Returns the
+        number of rows reset."""
+        conn = self._db()
+        try:
+            stuck = [r["id"] for r in conn.execute(
+                "SELECT id FROM agent_sessions WHERE status = 'running'"
+            ).fetchall()]
+            if stuck:
+                conn.execute(
+                    "UPDATE agent_sessions SET status = 'idle' WHERE status = 'running'"
+                )
+                conn.commit()
+                logger.warning(
+                    "Startup recovery: reset %d agent session(s) left 'running' "
+                    "by a previous process: %s",
+                    len(stuck), stuck,
+                )
+            return len(stuck)
+        finally:
+            conn.close()
 
     async def start_turn(
         self,
@@ -263,17 +301,83 @@ class AgentRunner:
         await self._publish_session(session_id)
         return user_msg
 
+    async def steer(
+        self,
+        session_id: int,
+        content: str,
+        *,
+        mentions: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist + publish a mid-run steering message. No new turn.
+
+        Only valid while a turn is running (the router falls back to this when
+        POST /messages hits the running-session 409). The event is
+        `steering/message`, NOT user/message — policy derives render and
+        destructive approval from the latest user/message, so steering must
+        never silently grant or void permissions. The running loop drains
+        these between steps and injects them into its in-flight request
+        history. Returns the published chat row, or None when the session is
+        not running (caller should start a normal turn instead).
+        """
+        if not self.is_running(session_id):
+            return None
+
+        extra: dict[str, Any] = {}
+        if mentions:
+            extra["mentions"] = mentions
+        if attachments:
+            extra["attachments"] = attachments
+        event = session_log.append_event(
+            session_id,
+            session_log.STEERING_MESSAGE,
+            {"content": content, **extra},
+        )
+        # Mirror into agent_messages so legacy readers see the row; the event
+        # log stays authoritative (role user, status steering).
+        conn = self._db()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO agent_messages
+                (session_id, role, content, agent_name, status)
+                VALUES (?, 'user', ?, NULL, 'steering')
+                """,
+                (session_id, content or ""),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_messages WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        from calliope.db import row_to_dict
+
+        out = row_to_dict(row)
+        out["seq"] = event.seq
+        if mentions:
+            out["mentions"] = mentions
+        if attachments:
+            out["attachments"] = attachments
+        await event_bus.publish("agent.message", {"message": out})
+        return out
+
     async def _run_session(self, session_id: int) -> None:
         conn = self._db()
         try:
             row = conn.execute(
-                "SELECT project_id FROM agent_sessions WHERE id = ?", (session_id,)
+                "SELECT project_id, origin FROM agent_sessions WHERE id = ?", (session_id,)
             ).fetchone()
             project_id = row["project_id"] if row else None
+            origin = (row["origin"] if row else None) or "chat"
         finally:
             conn.close()
 
-        ctx = ToolContext(session_id=session_id, project_id=project_id)
+        ctx = ToolContext(
+            session_id=session_id,
+            project_id=project_id,
+            origin=origin,
+        )
         try:
             final = await orchestrate(
                 ctx,

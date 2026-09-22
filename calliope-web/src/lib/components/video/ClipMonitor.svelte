@@ -9,33 +9,40 @@
 	import Icon from '$lib/components/ui/Icon.svelte';
 	import ProgressBar from '$lib/components/ui/ProgressBar.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
+	import { t } from '$lib/i18n.svelte';
 
 	interface Progress {
 		progress?: number;
 		message?: string;
 	}
 
-	interface Props {
-		previewPath: string | null;
-		status: string;
-		heading: string;
-		orderIndex: number;
-		sceneId?: number;
-		progress?: Progress | null;
-		error?: string;
-		errorLong?: boolean;
-	}
+interface Props {
+	previewPath: string | null;
+	status: string;
+	heading: string;
+	orderIndex: number;
+	/** Display label, e.g. '#3.2' — shown on the slate + id strip instead of the plain index. */
+	label?: string;
+	/** Secondary id line, e.g. 'clip 512'. */
+	idLabel?: string;
+	sceneId?: number;
+	progress?: Progress | null;
+	error?: string;
+	errorLong?: boolean;
+}
 
-	let {
-		previewPath,
-		status,
-		heading,
-		orderIndex,
-		sceneId,
-		progress = null,
-		error = '',
-		errorLong = false,
-	}: Props = $props();
+let {
+	previewPath,
+	status,
+	heading,
+	orderIndex,
+	label,
+	idLabel,
+	sceneId,
+	progress = null,
+	error = '',
+	errorLong = false,
+}: Props = $props();
 
 	let errorOpen = $state(false);
 	// '#t=0.1' media fragment: with preload="metadata" browsers paint NOTHING
@@ -53,19 +60,21 @@
 <div class="monitor">
 	<div class="frame">
 		{#if previewUrl}
-			<SafeMedia class="media" src={previewUrl} kind="video" label="Video unavailable" />
+			<SafeMedia class="media" src={previewUrl} kind="video" label={t('clipMonitor.videoUnavailable')} />
 		{:else}
 			<div class="empty">
-				<span class="slate">#{orderIndex}</span>
-				{#if sceneId != null}
-					<p class="sid">scene_id {sceneId}</p>
+				<span class="slate">{label ?? `#${orderIndex}`}</span>
+				{#if idLabel}
+					<p class="sid">{idLabel}</p>
+				{:else if sceneId != null}
+					<p class="sid">{t('clipMonitor.sceneId', { id: sceneId })}</p>
 				{/if}
-				<p class="title">{heading || 'Untitled'}</p>
+				<p class="title">{heading || t('clipMonitor.untitled')}</p>
 				{#if status === 'pending' || status === 'running'}
 					<div class="busy" aria-busy="true">
 						<div class="busy-head">
 							<Spinner size="sm" />
-							<span>{status === 'running' ? 'Generating…' : 'Queued — waiting for a worker'}</span>
+							<span>{status === 'running' ? t('clipMonitor.generating') : t('clipMonitor.queued')}</span>
 						</div>
 						{#if status === 'running'}
 							<ProgressBar
@@ -78,30 +87,32 @@
 					</div>
 				{:else if status === 'failed'}
 					<div class="fail">
-						<p class="err" class:open={errorOpen}>{error || 'Generation failed'}</p>
+						<p class="err" class:open={errorOpen}>{error || t('clipMonitor.generationFailed')}</p>
 						{#if errorLong}
 							<Button variant="ghost" size="sm" onclick={() => (errorOpen = !errorOpen)}>
-								{errorOpen ? 'Hide details' : 'Show details'}
+								{errorOpen ? t('clipMonitor.hideDetails') : t('clipMonitor.showDetails')}
 							</Button>
 						{/if}
 					</div>
 				{:else}
-					<p class="hint">No render yet — describe the shot below and generate.</p>
+					<p class="hint">{t('clipMonitor.noRenderHint')}</p>
 				{/if}
 			</div>
 		{/if}
 	</div>
 
 	<div class="ids">
-		<span>#{orderIndex}</span>
-		{#if sceneId != null}
-			<span class="ids-db">id {sceneId}</span>
+		<span>{label ?? `#${orderIndex}`}</span>
+		{#if idLabel}
+			<span class="ids-db">{idLabel}</span>
+		{:else if sceneId != null}
+			<span class="ids-db">{t('clipMonitor.id', { id: sceneId })}</span>
 		{/if}
 	</div>
 	{#if previewUrl}
 		<div class="foot">
 			<a class="dl" href={previewUrl} download>
-				<Icon name="download" size={14} /> Download clip
+				<Icon name="download" size={14} /> {t('clipMonitor.downloadClip')}
 			</a>
 		</div>
 	{/if}

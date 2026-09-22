@@ -1,5 +1,5 @@
 /** Shared shape for Omni / video ref pickers. */
-export type AssetGroup = 'character' | 'location' | 'item' | 'upload' | 'clip';
+export type AssetGroup = 'character' | 'location' | 'item' | 'upload' | 'clip' | 'shot';
 
 export interface AssetOption {
 	label: string;
@@ -13,6 +13,7 @@ const GROUP_FROM_SUFFIX: Array<{ re: RegExp; group: AssetGroup }> = [
 	{ re: /\s·\s*environment$/i, group: 'location' },
 	{ re: /\s·\s*item$/i, group: 'item' },
 	{ re: /\s·\s*upload$/i, group: 'upload' },
+	{ re: /\s·\s*blockout(\s+clip)?$/i, group: 'shot' },
 	{ re: /^clip\s*#/i, group: 'clip' },
 ];
 
@@ -26,13 +27,14 @@ export function assetGroup(opt: AssetOption): AssetGroup {
 
 /** Strip the " · sheet" style suffix so the tab already names the type. */
 export function assetDisplayName(opt: AssetOption): string {
-	return opt.label.replace(/\s·\s*(sheet|environment|item|upload)\s*$/i, '').trim() || opt.label;
+	return opt.label.replace(/\s·\s*(sheet|environment|item|upload|blockout(\s+clip)?)\s*$/i, '').trim() || opt.label;
 }
 
 export const ASSET_GROUP_TABS: Array<{ id: AssetGroup; label: string }> = [
 	{ id: 'character', label: 'Characters' },
 	{ id: 'location', label: 'Environments' },
 	{ id: 'item', label: 'Misc. Items' },
+	{ id: 'shot', label: 'From Build Scene' },
 	{ id: 'clip', label: 'Clips' },
 	{ id: 'upload', label: 'Uploads' },
 ];
@@ -43,6 +45,6 @@ export function tabsForMediaKind(kind: string | undefined): Array<{ id: AssetGro
 			? ['clip', 'upload']
 			: kind === 'audio'
 				? ['upload']
-				: ['character', 'location', 'item', 'upload'];
+				: ['character', 'location', 'item', 'shot', 'upload'];
 	return ASSET_GROUP_TABS.filter((t) => ids.includes(t.id));
 }

@@ -89,18 +89,25 @@ def target_fps(probes: list[dict[str, Any]]) -> float:
 
 
 def collect_clips(project_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Scenes in story order, split into (with video_path, without)."""
+    """Clips in global playback order (scene order, then clip order), split
+    into (with clip_path, without). Each row keeps its scene heading for the
+    skip-progress messages."""
     conn = get_db(config.settings.db_path)
     try:
         rows = conn.execute(
-            "SELECT * FROM scenes WHERE project_id = ? ORDER BY order_index",
+            """
+            SELECT c.*, s.heading, s.order_index AS scene_order_index
+            FROM clips c JOIN scenes s ON s.id = c.scene_id
+            WHERE c.project_id = ?
+            ORDER BY s.order_index, c.order_index, c.id
+            """,
             (project_id,),
         ).fetchall()
-        scenes = [row_to_dict(r) for r in rows]
+        clips = [dict(r) for r in rows]
     finally:
         conn.close()
-    with_clip = [s for s in scenes if s.get("video_path")]
-    skipped = [s for s in scenes if not s.get("video_path")]
+    with_clip = [c for c in clips if c.get("clip_path")]
+    skipped = [c for c in clips if not c.get("clip_path")]
     return with_clip, skipped
 
 
@@ -167,7 +174,7 @@ def build_ffmpeg_cmd(
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     cmd: list[str] = [ffmpeg, "-nostdin", "-nostats", "-progress", "pipe:1", "-y"]
     for clip in clips:
-        cmd += ["-i", str(clip["video_path"])]
+        cmd += ["-i", str(clip["clip_path"])]
     # Silent clips get a lavfi silence donor input, appended after the clip inputs
     # so input indices for real clips stay 0..n-1.
     lavfi_index: dict[int, int] = {}
@@ -249,14 +256,17 @@ async def run_export(
     if not clips:
         raise RuntimeError("No scene clips to export — generate videos first")
 
-    for scene in skipped:
-        heading = (scene.get("heading") or f"Scene {scene.get('order_index')}").strip()
+    for clip in skipped:
+        heading = (
+            (clip.get("heading") or f"Scene {clip.get('scene_order_index')}").strip()
+        )
+        label = f"{clip.get('scene_order_index')}.{clip.get('order_index')} · {heading}"
         await bus.publish(
             "job.progress",
             {
                 "job_id": job_id,
                 "kind": "export",
-                "message": f"Skipping scene «{heading}» — no clip",
+                "message": f"Skipping clip «{label}» — no video",
             },
         )
 
@@ -269,7 +279,7 @@ async def run_export(
         return [str(dest)]
 
     _require_binary("ffmpeg")
-    probes = [await probe(clip["video_path"]) for clip in clips]
+    probes = [await probe(clip["clip_path"]) for clip in clips]
     fps = target_fps(probes)
     durations = [float(p["duration"]) for p in probes]
     total_us = (sum(durations) - XFADE_SEC * max(0, len(clips) - 1)) * 1_000_000

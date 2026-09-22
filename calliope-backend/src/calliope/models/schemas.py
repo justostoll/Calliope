@@ -3,11 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class ProjectCreate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
+    """`name` is accepted as an alias for `title` — LLM agents and external API
+    clients very often emit `name` for the required project title field and get
+    an opaque 422 otherwise."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    title: str = Field(..., min_length=1, max_length=200, validation_alias=AliasChoices("title", "name"))
     idea: str | None = None
     genre: str | None = None
     tone: str | None = None
@@ -15,7 +21,11 @@ class ProjectCreate(BaseModel):
 
 
 class ProjectUpdate(BaseModel):
-    title: str | None = Field(None, min_length=1, max_length=200)
+    model_config = ConfigDict(populate_by_name=True)
+
+    title: str | None = Field(
+        None, min_length=1, max_length=200, validation_alias=AliasChoices("title", "name")
+    )
     idea: str | None = None
     genre: str | None = None
     tone: str | None = None
@@ -151,6 +161,39 @@ class SceneReorder(BaseModel):
     scene_ids: list[int]
 
 
+class ClipCreate(BaseModel):
+    order_index: int | None = None  # default: append at end of the scene
+    description: str | None = None
+    shot_size: str | None = None
+    dialog_lines_covered: list[int] | None = None
+    duration_sec: int | None = None
+    workflow_id: int | None = None
+    chain_from_prev: bool = False
+    video_settings: dict[str, Any] | None = None
+
+
+class ClipUpdate(BaseModel):
+    order_index: int | None = None
+    description: str | None = None
+    shot_size: str | None = None
+    dialog_lines_covered: list[int] | None = None
+    duration_sec: int | None = None
+    workflow_id: int | None = None
+    clip_path: str | None = None
+    chain_from_prev: bool | None = None
+    video_settings: dict[str, Any] | None = None
+
+
+class ClipReorder(BaseModel):
+    clip_ids: list[int]
+
+
+class ExpandClipsRequest(BaseModel):
+    scene_ids: list[int] | None = None
+    guidance: str | None = None
+    clip_cap: int | None = None
+
+
 class WorkflowCreate(BaseModel):
     name: str = Field(..., min_length=1)
     kind: Literal["image", "video"] = "image"
@@ -173,6 +216,7 @@ class WorkflowAnalyze(BaseModel):
 
 class JobCreate(BaseModel):
     scene_id: int | None = None
+    clip_id: int | None = None
     kind: str
     workflow_id: int | None = None
     input_values: dict[str, Any] | None = None
@@ -201,14 +245,17 @@ class GenerateScenesRequest(BaseModel):
 
 
 class GenerateVideosRequest(BaseModel):
+    # Clip scoping is canonical; scene_ids expands to all clips of those scenes.
     scene_ids: list[int] | None = None
+    clip_ids: list[int] | None = None
     workflow_id: int | None = None
     input_values: dict[str, Any] | None = None
-    # Scene-id → confirmed prompt text (from the review modal). Wins over the
+    # Clip-id → confirmed prompt text (from the review modal). Wins over the
     # LLM rewrite and over any saved draft.
     prompts: dict[int, str] | None = None
 
 
 class PreviewPromptRequest(BaseModel):
-    scene_id: int
+    scene_id: int | None = None
+    clip_id: int | None = None
     workflow_id: int | None = None

@@ -74,31 +74,41 @@ def register(registry: ToolRegistry) -> None:
         ToolDefinition(
             name="enqueue_video_jobs",
             description=(
-                "Queue video clip generation for SPECIFIC scenes. Users say "
-                "'#25' / 'scene 25' meaning Video-page order — pass those as "
-                "orders, or list_scenes.scene_id as scene_ids. NEVER dump every "
-                "scene_id. NEVER omit the target list (that used to mean 'all' "
-                "and flooded the queue). Set all_scenes=true ONLY when the user "
-                "explicitly asked for every clip. More than 3 clips is blocked "
-                "unless they said all/every/entire."
+                "Queue video generation for SPECIFIC clips (a scene may hold "
+                "several clips; each renders one ~5-10s video). Address them by "
+                "clip_ids (from list_clips) or refs ('#3.2'). Scene-level "
+                "shorthand still works: orders / scene_ids from list_scenes "
+                "expand to ALL of that scene's clips. NEVER dump every id. "
+                "NEVER omit the target list. all_clips=true ONLY when the user "
+                "explicitly asked for the whole film. More than 3 clips is "
+                "blocked unless they said all/every/entire."
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "clip_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Database clip ids from list_clips — most precise",
+                    },
+                    "refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Clip labels like '#3.2' (users say this form)",
+                    },
                     "orders": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "description": (
-                            "Video page clip numbers (#1, #25). Preferred when "
-                            "the user names scenes by #."
+                            "Scene order numbers (#3) — expands to every clip of scene 3"
                         ),
                     },
                     "scene_ids": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Database ids from list_scenes.scene_id — not #N",
+                        "description": "Database scene ids from list_scenes.scene_id",
                     },
-                    "all_scenes": {
+                    "all_clips": {
                         "type": "boolean",
                         "description": "True only if the user asked to render every clip",
                     },
@@ -298,6 +308,10 @@ def register(registry: ToolRegistry) -> None:
             executor=t_wait_for_jobs,
             category="video",
             requires_project=False,
+            # Owns its own wait contract (timeout_sec → queue_poll_timeout_sec):
+            # exempt from the per-tool wall-clock cap, which would otherwise
+            # cut a legitimate long render wait short.
+            long_running=True,
         )
     )
     registry.register(
@@ -456,16 +470,39 @@ def _int_list(raw: Any) -> list[int]:
 
 async def t_enqueue_video_jobs(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     from calliope.agent.harness import log as session_log
-    from calliope.agent.harness.plugins.script import resolve_scene_ref
+    from calliope.agent.harness.plugins.script import (
+        _resolve_clip_ref,
+        resolve_scene_ref,
+    )
     from calliope.agent.harness.policy import allows_bulk_video_enqueue
     from calliope.agent.video_agent import enqueue_video_jobs as _enqueue
 
+    clip_ids = _int_list(args.get("clip_ids"))
+    refs = [str(r) for r in (args.get("refs") or []) if str(r).strip()]
     scene_ids = _int_list(args.get("scene_ids"))
     orders = _int_list(args.get("orders"))
-    all_scenes = bool(args.get("all_scenes"))
+    all_clips = bool(args.get("all_clips") or args.get("all_scenes"))
     latest = session_log.latest_user_message(ctx.session_id) or ""
 
-    resolved: list[int] = []
+    # Clip-level resolution: exact clips win over scene expansion.
+    resolved_clips: list[int] = []
+    if clip_ids or refs:
+        conn = _db()
+        try:
+            for cid in clip_ids:
+                found, err = _resolve_clip_ref(conn, ctx.project_id, clip_id=cid)
+                if err:
+                    return {"ok": False, "error": err}
+                resolved_clips.append(found)
+            for ref in refs:
+                found, err = _resolve_clip_ref(conn, ctx.project_id, ref=ref)
+                if err:
+                    return {"ok": False, "error": err}
+                resolved_clips.append(found)
+        finally:
+            conn.close()
+
+    resolved_scenes: list[int] = []
     if orders or scene_ids:
         conn = _db()
         try:
@@ -473,66 +510,76 @@ async def t_enqueue_video_jobs(ctx: ToolContext, args: dict[str, Any]) -> dict[s
                 found, err = resolve_scene_ref(conn, ctx.project_id, scene_id=sid)
                 if err:
                     return {"ok": False, "error": err}
-                resolved.append(found)
+                resolved_scenes.append(found)
             for order in orders:
                 found, err = resolve_scene_ref(conn, ctx.project_id, order=order)
                 if err:
                     return {"ok": False, "error": err}
-                resolved.append(found)
+                resolved_scenes.append(found)
+            # Scene shorthand expands to ALL of that scene's clips (playback order).
+            if resolved_scenes:
+                placeholders = ",".join("?" * len(resolved_scenes))
+                for r in conn.execute(
+                    f"SELECT id FROM clips WHERE scene_id IN ({placeholders}) "
+                    "ORDER BY scene_id, order_index, id",
+                    resolved_scenes,
+                ).fetchall():
+                    resolved_clips.append(int(r["id"]))
         finally:
             conn.close()
-        # Preserve order, drop dupes.
-        seen: set[int] = set()
-        unique: list[int] = []
-        for sid in resolved:
-            if sid not in seen:
-                seen.add(sid)
-                unique.append(sid)
-        resolved = unique
-    elif all_scenes:
-        conn = _db()
-        try:
-            rows = conn.execute(
-                "SELECT id FROM scenes WHERE project_id = ? ORDER BY order_index",
-                (ctx.project_id,),
-            ).fetchall()
-            resolved = [int(r["id"]) for r in rows]
-        finally:
-            conn.close()
-    else:
-        return {
-            "ok": False,
-            "error": (
-                "Say which clips: pass orders (Video page #N) or scene_ids "
-                "from list_scenes. Do not enqueue the whole timeline. "
-                "all_scenes=true only when the user asked for every clip."
-            ),
-        }
 
-    if not resolved:
-        return {"ok": False, "error": "No matching scenes to enqueue"}
+    if not resolved_clips and not resolved_scenes:
+        if all_clips:
+            conn = _db()
+            try:
+                resolved_clips = [
+                    int(r["id"])
+                    for r in conn.execute(
+                        "SELECT id FROM clips WHERE project_id = ?",
+                        (ctx.project_id,),
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+        else:
+            return {
+                "ok": False,
+                "error": (
+                    "Say which clips: pass refs ('#3.2') or clip_ids from "
+                    "list_clips — a scene may hold several clips. Scene-level "
+                    "orders/scene_ids expand to all of that scene's clips. "
+                    "all_clips=true only when the user asked for the whole film."
+                ),
+            }
 
-    allowed_bulk = allows_bulk_video_enqueue(latest, len(resolved))
+    # Preserve order, drop dupes.
+    seen: set[int] = set()
+    resolved_clips = [c for c in resolved_clips if not (c in seen or seen.add(c))]
+
+    if not resolved_clips:
+        return {"ok": False, "error": "No matching clips to enqueue"}
+
+    allowed_bulk = allows_bulk_video_enqueue(latest, len(resolved_clips))
     if not allowed_bulk:
         return {
             "ok": False,
             "error": (
-                f"Blocked: {len(resolved)} clips is a bulk render. Users usually "
-                "mean the #N they named (2–3 clips). Pass only those orders, or "
-                "wait until they say all scenes / every clip / the entire film."
+                f"Blocked: {len(resolved_clips)} clips is a bulk render. Users usually "
+                "mean the ones they named (2–3 clips). Pass only those refs/clip_ids, "
+                "or wait until they say all clips / the entire film."
             ),
         }
 
     try:
         jobs = await _enqueue(
             ctx.project_id,
-            scene_ids=resolved,
+            clip_ids=resolved_clips,
             workflow_id=args.get("workflow_id"),
             session_id=ctx.session_id,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    return {"jobs": jobs, "count": len(jobs), "scene_ids": resolved}
+    return {"jobs": jobs, "count": len(jobs), "clip_ids": resolved_clips}
 
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -725,16 +772,23 @@ async def t_run_workflow(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
                 "SELECT id FROM scenes WHERE id = ? AND project_id = ?",
                 (scene_id, int(ctx.project_id)),
             ).fetchone()
+            if not scene:
+                return {"ok": False, "error": f"Scene {scene_id} not found in this project"}
+            # A scene's first clip is the write target (1 scene : N clips — a
+            # run_workflow video always lands on clip #1 of the scene).
+            first_clip = conn.execute(
+                "SELECT id FROM clips WHERE scene_id = ? ORDER BY order_index, id LIMIT 1",
+                (scene_id,),
+            ).fetchone()
         finally:
             conn.close()
-        if not scene:
-            return {"ok": False, "error": f"Scene {scene_id} not found in this project"}
         from calliope.agent.video_agent import enqueue_video_jobs as _enqueue
 
         try:
             jobs = await _enqueue(
                 int(ctx.project_id),
-                scene_ids=[scene_id],
+                clip_ids=[int(first_clip["id"])] if first_clip else None,
+                scene_ids=[scene_id] if first_clip is None else None,
                 workflow_id=workflow_id,
             )
         except ValueError as exc:
@@ -1152,6 +1206,10 @@ async def t_wait_for_jobs(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
     timeout = _resolve_wait_timeout(args)
     deadline = None if timeout <= 0 else asyncio.get_event_loop().time() + timeout
     queue_pid = _queue_project_id(ctx)
+    # Progress heartbeat: a long wait must not read as a dead "Working…" in
+    # the chat — publish a thinking line roughly every 30s while jobs run.
+    _PROGRESS_INTERVAL_S = 30.0
+    next_progress = asyncio.get_event_loop().time() + _PROGRESS_INTERVAL_S
     while True:
         jobs: list[dict[str, Any]] = []
         invalid: list[int] = []
@@ -1185,6 +1243,22 @@ async def t_wait_for_jobs(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
                 "error": f"Timed out after {timeout}s waiting for {len(active)} job(s)",
                 "jobs": [_sc_job_dict_lite(j) for j in active],
             }
+        now = asyncio.get_event_loop().time()
+        if now >= next_progress:
+            from calliope.events.bus import event_bus
+
+            await event_bus.publish(
+                "agent.thinking",
+                {
+                    "session_id": ctx.session_id,
+                    "content": (
+                        f"Still waiting on {len(active)} render job(s) "
+                        f"(#{', #'.join(str(j['id']) for j in active[:5])}"
+                        f"{'…' if len(active) > 5 else ''})…"
+                    ),
+                },
+            )
+            next_progress = now + _PROGRESS_INTERVAL_S
         await asyncio.sleep(3)
 
 

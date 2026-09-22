@@ -13,14 +13,33 @@ STORY_GENERATION_SYSTEM = (
 )
 
 SCRIPT_GENERATION_SYSTEM = (
-    "You are a screenwriter for short-form AI video. "
+    "You are a screenwriter for AI video production. "
     "Write a scene-by-scene script that uses the provided characters and locations. "
-    "Each scene's action is fed directly into a video generation model, so it must be a "
-    "rich, multi-sentence cinematic description — never a single short sentence. "
+    "A scene is a SCREENPLAY unit — a heading, full action prose, and all dialogue that plays "
+    "in it — exactly like a produced script. Scenes may be long; a later 'break into shots' "
+    "pass splits each scene into short renderable clips, so never compress the content to fit "
+    "a single video generation. "
     "Always respond with a single valid JSON object. "
     "HARD RULE: the scenes array length must equal required_scene_count from the user message. "
     "Returning fewer scenes is a failure. Respect the user's chosen scene count."
 )
+
+
+def estimate_scene_duration_sec(scene: dict[str, Any]) -> int:
+    """Content-derived duration estimate for one scene.
+
+    Dialogue reads at ~150 wpm (2.5 words/sec) + performance beats; action
+    prose at ~1 beat per 25 words, minimum 3 seconds. Replaces flat LLM
+    guesses so a scene's runtime matches what it actually contains — the
+    coverage pass splits this budget across the scene's clips.
+    """
+    dialog_words = len((scene.get("dialog") or "").split())
+    action_words = len((scene.get("action") or "").split())
+    secs = dialog_words / 2.5 + action_words / 25.0 * 3.0
+    return max(3, min(600, round(secs))) or 3
+
+
+DEFAULT_CLIP_DURATION_SEC = 8  # per-clip cap the coverage pass splits scenes into
 
 
 def estimate_target_seconds(target_duration: str | None) -> int:
@@ -294,7 +313,6 @@ def build_script_messages(
     scene_n = max(recommended, int(scene_count)) if scene_count and scene_count > 0 else recommended
     # Stretch runtime floor when the user asked for more clips than duration alone implies
     secs = max(secs, scene_n * 6)
-    duration_hint = max(4, round(secs / scene_n))
     char_lines = "\n".join(
         f"- id={c['id']} {c['name']} ({c.get('role') or ''}): {c.get('appearance') or ''}"
         for c in characters
@@ -325,35 +343,37 @@ Locations:
 === HARD CONSTRAINTS (non-negotiable) ===
 1. The JSON field "scenes" MUST contain EXACTLY {scene_n} objects.
 2. order_index must run 1, 2, 3, ... {scene_n} with no gaps.
-3. Do NOT collapse back to fewer scenes. The user expanded the script to {scene_n} clips — fill all of them.
-4. Sum of duration_sec across all scenes should be approximately {secs} (within ±15%).
-5. Prefer short scenes (5–10s) — this is for AI video clips. Spread the beat arc across all {scene_n} scenes.
+3. Do NOT collapse back to fewer scenes. The user expanded the script to {scene_n} scenes — fill all of them.
+4. Spread the full story across all {scene_n} scenes. A scene is a SCREENPLAY unit — it may
+   run 30–120 seconds when the material needs it (a later pass breaks long scenes into
+   short renderable clips). NEVER compress or summarize action to make a scene shorter.
+5. Pace the total toward ~{secs} seconds overall — scenes with lots of dialogue run longer.
 
-=== ACTION DETAIL (this text IS the video prompt — users copy it straight into the generator) ===
-Each scene's "action" is fed verbatim to an AI video generator. Write 4–6 vivid present-tense
-sentences (~80–130 words) per scene as ONE flowing natural-English paragraph — no bullet points,
-no labeled fragments (do NOT write "Shot:", "Lighting:", etc.), no line breaks. Rules:
-1. ONE SHOT PER SCENE. A clip is only {duration_hint} seconds — describe a single continuous
-   camera setup with at most one simple action beat (one entrance, one gesture, one reveal).
-   If a beat needs more room, split it across multiple scenes instead of compressing it.
-2. SHOT & MOTION. Name the framing and camera move (wide establishing, slow push-in, handheld
-   tracking, low angle, rack focus) AND what visibly moves in frame — video models need motion:
-   gestures, turning heads, hair and fabric, drifting dust, sweeping flashlight beams, an
-   expression shifting. A static description produces a static clip.
-3. CHARACTER ANCHORS. The first time each character appears in a scene, attach a 3–8 word
+=== ACTION (full visible action prose — the fidelity contract) ===
+Each scene's "action" is the complete on-screen action for that scene, present tense,
+ONE flowing natural-English paragraph — no bullet points, no labeled fragments (do NOT
+write "Shot:", "Lighting:", etc.), no line breaks. Cover EVERYTHING that visibly happens
+in the scene from start to finish: entrances, blocking, gestures, reveals, who moves
+where. Rules:
+1. MOTION. Name framing and camera behavior where natural (wide establishing, slow
+   push-in, handheld tracking, low angle) AND what visibly moves in frame — gestures,
+   turning heads, hair and fabric, drifting dust, an expression shifting. A static
+   description produces a static clip downstream.
+2. CHARACTER ANCHORS. The first time each character appears in a scene, attach a 3–8 word
    visual anchor taken from their description above (hair, outfit, one distinguishing
    feature), e.g. "MIA, a teenage girl with a chestnut ponytail and yellow rain jacket,".
    Later mentions in the same scene use the plain name. Never invent new appearance details —
    reuse these anchors so every clip matches the same face and wardrobe.
-4. ENVIRONMENT & CONTINUITY. Concrete set details, props, weather, time-of-day — consistent
+3. ENVIRONMENT & CONTINUITY. Concrete set details, props, weather, time-of-day — consistent
    with the location description and with earlier scenes set in the same location.
-5. LIGHTING & MOOD. Named light sources, color palette, emotional tone of the moment.
+4. LIGHTING & MOOD. Named light sources, color palette, emotional tone of the moment.
 Describe only what is VISIBLE (no inner thoughts; no sounds or music — dialogue covers audio).
-Vary shot types across scenes — do not write {scene_n} identical wide shots.
 
-=== DIALOGUE ===
-Keep lines short and natural. When delivery matters for performance, add a brief cue in
-parentheses after the speaker name, e.g. "MIA (whispering): line" or "LIAM (hushed, excited): line".
+=== DIALOGUE (verbatim fidelity) ===
+Every line the scene needs MUST appear in "dialog", formatted 'SPEAKER: line', one per
+line, in play order. NEVER paraphrase, summarize, or drop lines ("they argue about the
+money" is a FAILURE — write the actual lines). When delivery matters for performance,
+add a brief cue in parentheses after the speaker name, e.g. "MIA (whispering): line".
 
 Respond ONLY with JSON:
 {{
@@ -363,7 +383,7 @@ Respond ONLY with JSON:
       "heading": "INT. LOCATION - TIME",
       "action": "Wide establishing shot, slow push-in through the cracked main doorway. MIA, a teenage girl with a chestnut ponytail and yellow rain jacket, steps into the dusty main hall, lantern held high, its warm glow catching drifting dust motes around her cautious, widening eyes. She freezes mid-step, fingers tightening on the lantern handle as she looks up. Overturned desks and a collapsed chalkboard fill the frame; moonlight cuts through shattered windows in pale blue shafts. The mood is hushed and uneasy, shadows pooling at the edges of the lantern light.",
       "dialog": "MIA (whispering): line\\nNARRATOR: line",
-      "duration_sec": 5,
+      "duration_sec": 8,
       "character_ids": [1],
       "location_id": 1
     }}
@@ -371,9 +391,9 @@ Respond ONLY with JSON:
 }}
 
 Use only the provided character_ids and location_ids.
-FINAL CHECK before responding: scenes.length == {scene_n}, and every action is a flowing prose
-paragraph of 4–6 sentences (~80–130 words) covering ONE shot, with a character anchor at each
-character's first mention (no bullets, no labels, no invented appearances). If not, fix it."""
+FINAL CHECK before responding: scenes.length == {scene_n}, every action is a flowing prose
+paragraph covering the WHOLE on-screen action, and every dialogue line is written out
+verbatim in "dialog" (no summaries). If not, fix it."""
     return [
         {"role": "system", "content": SCRIPT_GENERATION_SYSTEM},
         {"role": "user", "content": user},
@@ -401,7 +421,6 @@ def build_script_chunk_messages(
     continuity — heading style, location, who's on screen — without resending
     the whole script."""
     secs = estimate_target_seconds(target_duration)
-    per_scene = max(4, round(secs / max(1, scene_count)))
     char_lines = "\n".join(
         f"- id={c['id']} {c['name']} ({c.get('role') or ''}): {c.get('appearance') or ''}"
         for c in characters
@@ -446,36 +465,39 @@ Locations:
 === HARD CONSTRAINTS (non-negotiable) ===
 1. The JSON field "scenes" MUST contain EXACTLY {chunk_scenes} objects.
 2. order_index must run {chunk_start}, {chunk_start + 1}, ... {last} with no gaps.
-3. Each scene ~{per_scene} seconds (5–10s typical) — these are AI video clips.
+3. A scene is a SCREENPLAY unit — it may run 30–120 seconds when the material needs it
+   (a later pass breaks long scenes into short renderable clips). NEVER compress or
+   summarize action to make a scene shorter.
 4. Advance the beat arc across the whole {scene_count}-scene story; this chunk covers
    the part that falls at scenes {chunk_start}–{last}.
 5. If earlier scenes are listed above, continue them naturally — same characters,
    consistent location, no abrupt reset{'' if previous_tail else ' (this is the first chunk)'}.
 
-=== ACTION DETAIL (this text IS the video prompt — users copy it straight into the generator) ===
-Each scene's "action" is fed verbatim to an AI video generator. Write 4–6 vivid present-tense
-sentences (~80–130 words) per scene as ONE flowing natural-English paragraph — no bullet points,
-no labeled fragments (do NOT write "Shot:", "Lighting:", etc.), no line breaks. Rules:
-1. ONE SHOT PER SCENE. A clip is only {per_scene} seconds — describe a single continuous
-   camera setup with at most one simple action beat (one entrance, one gesture, one reveal).
-2. SHOT & MOTION. Name the framing and camera move (wide establishing, slow push-in, handheld
-   tracking, low angle, rack focus) AND what visibly moves in frame — video models need motion:
-   gestures, turning heads, hair and fabric, drifting dust, sweeping flashlight beams, an
-   expression shifting. A static description produces a static clip.
-3. CHARACTER ANCHORS. The first time each character appears in a scene, attach a 3–8 word
+=== ACTION (full visible action prose — the fidelity contract) ===
+Each scene's "action" is the complete on-screen action for that scene, present tense,
+ONE flowing natural-English paragraph — no bullet points, no labeled fragments (do NOT
+write "Shot:", "Lighting:", etc.), no line breaks. Cover EVERYTHING that visibly happens
+in the scene from start to finish: entrances, blocking, gestures, reveals, who moves
+where. Rules:
+1. MOTION. Name framing and camera behavior where natural (wide establishing, slow
+   push-in, handheld tracking, low angle) AND what visibly moves in frame — gestures,
+   turning heads, hair and fabric, drifting dust, an expression shifting. A static
+   description produces a static clip downstream.
+2. CHARACTER ANCHORS. The first time each character appears in a scene, attach a 3–8 word
    visual anchor taken from their description above (hair, outfit, one distinguishing
    feature), e.g. "MIA, a teenage girl with a chestnut ponytail and yellow rain jacket,".
    Later mentions in the same scene use the plain name. Never invent new appearance details —
    reuse these anchors so every clip matches the same face and wardrobe.
-4. ENVIRONMENT & CONTINUITY. Concrete set details, props, weather, time-of-day — consistent
+3. ENVIRONMENT & CONTINUITY. Concrete set details, props, weather, time-of-day — consistent
    with the location description and with earlier scenes set in the same location.
-5. LIGHTING & MOOD. Named light sources, color palette, emotional tone of the moment.
+4. LIGHTING & MOOD. Named light sources, color palette, emotional tone of the moment.
 Describe only what is VISIBLE (no inner thoughts; no sounds or music — dialogue covers audio).
-Vary shot types across scenes.
 
-=== DIALOGUE ===
-Keep lines short and natural. When delivery matters for performance, add a brief cue in
-parentheses after the speaker name, e.g. "MIA (whispering): line".
+=== DIALOGUE (verbatim fidelity) ===
+Every line the scene needs MUST appear in "dialog", formatted 'SPEAKER: line', one per
+line, in play order. NEVER paraphrase, summarize, or drop lines ("they argue about the
+money" is a FAILURE — write the actual lines). When delivery matters for performance,
+add a brief cue in parentheses after the speaker name, e.g. "MIA (whispering): line".
 
 Respond ONLY with JSON:
 {{
@@ -485,7 +507,7 @@ Respond ONLY with JSON:
       "heading": "INT. LOCATION - TIME",
       "action": "Wide establishing shot, slow push-in through the cracked main doorway. MIA, a teenage girl with a chestnut ponytail and yellow rain jacket, steps into the dusty main hall, lantern held high, its warm glow catching drifting dust motes around her cautious, widening eyes.",
       "dialog": "MIA (whispering): line",
-      "duration_sec": 5,
+      "duration_sec": 8,
       "character_ids": [1],
       "location_id": 1
     }}
@@ -494,9 +516,9 @@ Respond ONLY with JSON:
 
 Use only the provided character_ids and location_ids.
 FINAL CHECK before responding: scenes.length == {chunk_scenes}, order_index runs
-{chunk_start}..{last}, and every action is a flowing prose paragraph of 4–6 sentences
-(~80–130 words) covering ONE shot with a character anchor at each character's first
-mention (no bullets, no labels, no invented appearances). If not, fix it."""
+{chunk_start}..{last}, every action is a flowing prose paragraph covering the WHOLE
+on-screen action, and every dialogue line is written out verbatim in "dialog" (no
+summaries). If not, fix it."""
     return [
         {"role": "system", "content": SCRIPT_GENERATION_SYSTEM},
         {"role": "user", "content": user},
@@ -603,6 +625,7 @@ def scene_video_prompt(scene: dict[str, Any], characters: list[dict[str, Any]]) 
     parts = [
         scene.get("heading") or "",
         scene.get("action") or "",
+        scene.get("dialog") or "",
         f"featuring {char_bits}" if char_bits else "",
         "cinematic motion, coherent continuity",
     ]

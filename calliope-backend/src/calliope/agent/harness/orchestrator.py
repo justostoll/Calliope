@@ -16,10 +16,18 @@ from typing import Any
 
 from calliope.agent.harness import get_registry
 from calliope.agent.harness import log as session_log
-from calliope.agent.harness.loop import MessageSink, run_turn, _default_max_iterations
+from calliope.agent.harness.loop import (
+    FINAL_STEP_NUDGE,
+    MessageSink,
+    RepeatGuard,
+    _default_max_iterations,
+    apply_fail_streak,
+    run_turn,
+)
 from calliope.agent.harness.prompts import hardening_text
 from calliope.agent.harness.registry import ToolContext
 from calliope.agent.llm import LLMClient
+from calliope.config import settings
 from calliope.events.bus import event_bus
 
 logger = logging.getLogger("calliope.harness.orchestrator")
@@ -39,8 +47,70 @@ def _llm_for_role(role: str) -> LLMClient:
 # always survive the trim intact.
 MAX_HISTORY_USER_TURNS = 40
 
+# _run_sub_agent returns this prefix when it called ask_user — orchestrate
+# pauses the swarm on it (skips remaining tasks, no synthesis LLM call).
+_PAUSED_PREFIX = "Paused: "
+
+# Trivial-goal fast-path: one-line imperative messages skip the planner
+# round-trip entirely. The single loop has every tool, so a misfire just
+# loses the task-list UI — routing decision, not a permission change.
+_TRIVIAL_MAX_CHARS = 160
+_TRIVIAL_VERBS = (
+    "rename",
+    "update",
+    "set",
+    "change",
+    "edit",
+    "fix",
+    "show",
+    "list",
+    "what",
+    "how many",
+    "status",
+    "queue",
+    "where",
+    "who",
+    "delete",
+    "remove",
+)
+
+
+def _is_trivial_goal(goal: str) -> bool:
+    text = (goal or "").strip().lower()
+    if not text or len(text) > _TRIVIAL_MAX_CHARS:
+        return False
+    if any(sep in text for sep in ("\n", ";", " and then ", " then ")):
+        return False
+    return text.startswith(_TRIVIAL_VERBS)
+
+
+def _history_char_budget() -> int | None:
+    """Character budget for derived LLM history; 0 disables."""
+    try:
+        raw = int(getattr(settings, "agent_history_char_budget", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return raw if raw > 0 else None
+
+
+def _last_asked_question(session_id: int) -> str:
+    """The most recent unanswered ask_user question text, for the pause note."""
+    try:
+        for e in reversed(session_log.read_events(session_id)):
+            if e.type != session_log.QUESTION_ASKED:
+                continue
+            return str((e.data or {}).get("question") or "question asked")
+    except Exception:  # noqa: BLE001 — the note must never crash the pause path
+        pass
+    return "question asked"
+
+
 # Tool subsets per sub-agent role. Scoped tighter than the full registry so a
 # sub-agent cannot wander into another role's tools.
+#
+# `ask_user` is in EVERY role: a stuck sub-agent must be able to escalate to
+# the user instead of grinding its step budget (the same hardening run_turn
+# got for canvas/70). A question pauses the whole swarm — see _run_sub_agent.
 ROLE_TOOLS: dict[str, list[str]] = {
     "story": [
         "get_workspace",
@@ -49,22 +119,44 @@ ROLE_TOOLS: dict[str, list[str]] = {
         "add_beat",
         "update_beat",
         "delete_beat",
+        # Story tasks may structure beats INTO scenes — the planner schedules
+        # "break the beats into an 8-scene structure" as a story task, and a
+        # story agent without scene tools dead-ends with "add_scene is not
+        # available to this role" (session 908: scenes never got created, the
+        # script role then found "no scenes in the project").
+        "list_scenes",
+        "add_scene",
+        "update_scene",
+        "delete_scene",
         "list_workflows",
+        "ask_user",
     ],
     "script": [
         "get_workspace",
         "list_scenes",
+        "list_clips",
         "generate_script",
+        "break_into_shots",
+        "add_clip",
+        "update_clip",
+        "delete_clip",
         "update_scene",
         "add_scene",
         "delete_scene",
         "reorder_scenes",
+        "ask_user",
     ],
     "assets": [
         "get_workspace",
+        "add_character",
         "update_character",
+        "delete_character",
+        "add_location",
         "update_location",
+        "delete_location",
+        "add_item",
         "update_item",
+        "delete_item",
         "list_workflows",
         "comfy_server_info",
         "run_workflow",
@@ -76,10 +168,12 @@ ROLE_TOOLS: dict[str, list[str]] = {
         "wait_for_jobs",
         "post_artifact_to_canvas",
         "summarize_canvas",
+        "ask_user",
     ],
     "video": [
         "get_workspace",
         "list_scenes",
+        "list_clips",
         "list_workflows",
         "run_workflow",
         "enqueue_video_jobs",
@@ -88,6 +182,8 @@ ROLE_TOOLS: dict[str, list[str]] = {
         "get_job_status",
         "wait_for_jobs",
         "comfy_server_info",
+        "ask_user",
+        "post_artifact_to_canvas",
     ],
 }
 
@@ -107,7 +203,9 @@ Respond with ONLY a JSON object:
 
 Rules:
 - The standard EDIT pipeline (story → script → add/update assets text) is swarm work: one task per role, in that order.
+- ROLE BOUNDARIES: the story role owns BEATS (beats, characters, locations via generate_story/add_beat) — it cannot create scenes. The script role owns SCENES (add_scene, generate_script, break_into_shots). A "turn the story into N scenes" plan is a SCRIPT task; never schedule add_scene under the story role (session 908: a story task told to add_scene reported "tool not available to this role" and the whole build stalled).
 - Image/video GENERATION is human-in-the-loop, but the user's EXPLICIT choices grant permission: tagging a workflow (@mention), asking to "generate/render/create an image", or confirming an offer all count. When the user tagged a workflow AND named entities (characters/locations/scenes), schedule a single assets task whose goal says: run_workflow with the tagged workflow_id + per-entity prompts (character_ids=[…] for multiple characters), wait_for_jobs, then post_artifact_to_canvas for each output.
+- When ANY task involves generating videos/clips (enqueue_video_jobs / run_workflow for clips), the video role's tools are visible only if the user's message carries render intent — phrase that task's goal so the sub-agent first calls ask_user to confirm scope when unsure, rather than reporting "the generation tool is not exposed". Never schedule a render task and a text-only pass of the same scope.
 - For text-only edits (add/update characters, locations, items, scenes, story, script) with NO generation ask, schedule the edit task and DO NOT schedule render tasks.
 - Film clips: video sub-agent must enqueue_video_jobs with orders (#N on Video) or scene_ids from list_scenes — ONLY the clips the user named. Never dump every scene_id. Never add_scene to attach a generated mp4. Orphan jobs (scene_id null) do not show on the Video timeline.
 - A tagged workflow ([Calliope context] with workflow_id=) with entities named is a generation request: one assets task covers the text updates AND the render (the assets role has run_workflow/enqueue_asset_jobs). Never end a turn saying you lack enqueue access — the assets sub-agent has it.
@@ -118,12 +216,31 @@ Rules:
 
 
 def _scoped_payload(ctx: ToolContext, allowed: list[str]) -> list[dict[str, Any]]:
+    """The sub-agent's tool payload.
+
+    Deliberately bypasses `_visible`'s render-approval clause: sub-agents with
+    enqueue/run tools in their role MUST see them, or a planner-scheduled
+    render task dead-ends ("the generation tool is not exposed", session 908)
+    with no path to ask. Permission is enforced at execute time by the
+    `_render_approval_guard` denial, which teaches ask_user — a visible,
+    guard-denied tool is recoverable; a hidden one is a wall. Everything else
+    (requires_project / blind_only / scene scope) still filters here.
+    """
     registry = get_registry()
     out: list[dict[str, Any]] = []
     for n in allowed:
         t = registry.get(n)
-        if t is None or not registry._visible(t, ctx):
+        if t is None:
             continue
+        if t.requires_project and ctx.project_id is None:
+            continue
+        if t.blind_only and ctx.project_id is not None:
+            continue
+        if ctx.origin == "scene":
+            from calliope.agent.harness.registry import _scene_scoped
+
+            if not _scene_scoped(t):
+                continue
         out.append(
             {
                 "type": "function",
@@ -191,11 +308,36 @@ async def orchestrate(
     events = session_log.read_events(session_id)
     # Bound the LLM context to the last N user turns: long-lived sessions
     # would otherwise replay their entire history into every request.
-    derived = session_log.derive_llm_history(events, max_user_turns=MAX_HISTORY_USER_TURNS)
+    derived = session_log.derive_llm_history(
+        events,
+        max_user_turns=MAX_HISTORY_USER_TURNS,
+        max_chars=_history_char_budget(),
+    )
     goal = next(
         (m["content"] for m in reversed(derived) if m.get("role") == "user"),
         "",
     )
+
+    if ctx.project_id is None:
+        # Blind/sandbox session (Build Scene, sandbox canvas): every swarm
+        # role's tool subset is project-scoped, so the planner can only
+        # misroute here. Skip it entirely — straight to the single loop —
+        # which also drops the misleading "scheduling a sub-agent" note.
+        # (Checked BEFORE the workspace read: blind sessions were paying a
+        # get_workspace query + summary build only to discard both.)
+        history.clear()
+        history.extend(derived)
+        return await run_turn(ctx, history, on_message=on_message)
+
+    # Trivial-goal fast-path: a one-line imperative ("rename character 3 to
+    # Kira", "what's the queue status") does not need a planner round-trip.
+    # The single loop has every tool, so a misrouted complex request still
+    # completes — it just loses the task-list UI. Routing, not permission:
+    # render guards are untouched either way.
+    if _is_trivial_goal(goal):
+        history.clear()
+        history.extend(derived)
+        return await run_turn(ctx, history, on_message=on_message)
 
     ws_result = await get_registry().execute(ctx, "get_workspace", {})
     summary = json.dumps(ws_result, ensure_ascii=False, default=str)
@@ -203,11 +345,6 @@ async def orchestrate(
         summary = summary[:3000] + "…[truncated]"
 
     plan = await _plan(goal, summary)
-    if plan.get("mode") == "swarm" and ctx.project_id is None:
-        # Swarm sub-agents need project-scoped tools; in a sandbox the single
-        # loop handles create_project/link_project itself.
-        plan["mode"] = "single"
-        plan["tasks"] = []
     note = (plan.get("note") or "").strip()
     if note:
         session_log.append_event(
@@ -251,9 +388,51 @@ async def orchestrate(
         },
     )
     results: list[str] = []
+    paused = False
+    # Swarm-level steering watermark: corrections that land between tasks are
+    # folded into the next task's goal context (sub-agents see the user's
+    # course correction, not just the planner's original goal).
+    steer_watermark = session_log.steering_max_seq(session_id)
     for i, task in enumerate(norm_tasks):
         role = task["role"]
         goal_i = task["goal"]
+        if not paused:
+            steer_lines = [
+                str(s.data.get("content") or "").strip()
+                for s in session_log.drain_steering(session_id, steer_watermark)
+                if str(s.data.get("content") or "").strip()
+            ]
+            steer_watermark = session_log.steering_max_seq(session_id)
+            if steer_lines:
+                goal_i = goal_i + "\nMid-run user steering: " + " / ".join(steer_lines)
+        if paused:
+            # A previous sub-agent asked the user a question — later tasks may
+            # depend on the answer, so running them would waste work (and
+            # render permission). Skip cleanly; the user's reply re-routes.
+            session_log.append_event(
+                session_id,
+                session_log.TASK_END,
+                {"index": i, "status": "skipped"},
+            )
+            await event_bus.publish(
+                "agent.task", {"session_id": session_id, "index": i, "status": "skipped"}
+            )
+            session_log.append_event(
+                session_id,
+                session_log.ASSISTANT_MESSAGE,
+                {
+                    "content": f"Skipped (waiting for the user's answer): {goal_i}",
+                    "agent_name": f"{role}-agent",
+                },
+            )
+            await emit(
+                {
+                    "role": "assistant",
+                    "agent_name": f"{role}-agent",
+                    "content": f"Skipped (waiting for the user's answer): {goal_i}",
+                }
+            )
+            continue
         allowed = ROLE_TOOLS.get(role, ROLE_TOOLS["script"])
         session_log.append_event(session_id, session_log.TASK_START, {"index": i})
         await event_bus.publish(
@@ -308,6 +487,11 @@ async def orchestrate(
                     "content": answer,
                 }
             )
+            if answer.startswith(_PAUSED_PREFIX):
+                # The sub-agent called ask_user: the question card is already
+                # persisted (question/asked event), so stop the swarm here
+                # instead of running tasks whose inputs are unknown.
+                paused = True
         except Exception as exc:  # noqa: BLE001
             # Some exceptions stringify EMPTY (httpx.ReadTimeout/ReadError,
             # TimeoutError) — always name the type, and keep the traceback
@@ -342,6 +526,21 @@ async def orchestrate(
                     "status": "error",
                 }
             )
+
+    if paused:
+        # Deterministic pause message — no synthesis LLM call. The question
+        # card is in the log; the user's next message resumes the work.
+        final = (
+            "Paused for your answer: " + _last_asked_question(session_id)
+            + ". Remaining tasks were not started — reply to continue."
+        )
+        session_log.append_event(
+            session_id,
+            session_log.ASSISTANT_MESSAGE,
+            {"content": final, "agent_name": None},
+        )
+        await emit({"role": "assistant", "content": final})
+        return final
 
     # Synthesis: plain LLM call over sub-agent reports.
     synthesis_in = (
@@ -412,22 +611,42 @@ async def _run_sub_agent(
         "summary when done — no tool call.\n"
         "Image/video generation (enqueue_asset_jobs / enqueue_video_jobs / "
         "run_workflow) is human-in-the-loop: only call it when the user "
-        "explicitly asked to generate. A workflow_id= appendix is not "
-        "permission. There is no MCP run_workflow. Film clips: "
-        "enqueue_video_jobs with orders (Video #N) or scene_ids from "
-        "list_scenes — only the clips they named, never the whole timeline. "
-        "Never add_scene to attach an mp4. For text-only edits, "
-        "do the edit and stop."
+        "explicitly asked to generate. If the guard denies the call "
+        "(guard_render_approval), do NOT give up and do NOT claim the tool "
+        "is missing — it is available but gated. Call ask_user to confirm "
+        "generation with the user; their affirmative answer unlocks the "
+        "retry. A workflow_id= appendix is not permission. There is no MCP "
+        "run_workflow. Film clips: enqueue_video_jobs with orders (Video #N) "
+        "or scene_ids from list_scenes — only the clips they named, never "
+        "the whole timeline. Never add_scene to attach an mp4. For "
+        "text-only edits, do the edit and stop."
     )
     hardening = hardening_text()
     if hardening:
         system += "\n\n" + hardening
+    # Same safety nets as run_turn — the swarm must not be a second-class
+    # citizen (a stuck sub-agent ground its whole budget with no repeat
+    # guard and no change-course directive before this).
+    repeat = RepeatGuard()
+    fail_streak = 0
+    # Steering watermark, same contract as run_turn: drain at step
+    # boundaries only (after the previous step's tool results).
+    steer_watermark = session_log.steering_max_seq(ctx.session_id)
     final = ""
     try:
-        for _ in range(max_iterations):
+        for iteration in range(1, max_iterations + 1):
+            for s in session_log.drain_steering(ctx.session_id, steer_watermark):
+                steer_watermark = max(steer_watermark, s.seq)
+                messages.append(
+                    {"role": "user", "content": session_log.steering_user_content(s.data)}
+                )
             payload = _scoped_payload(ctx, allowed_tools)
+            step_messages = list(messages)
+            if max_iterations - iteration == 0:
+                # Final-step budget nudge: wrap up, don't start new work.
+                step_messages.append({"role": "user", "content": FINAL_STEP_NUDGE})
             msg = await client.chat_with_tools(
-                [{"role": "system", "content": system}] + messages,
+                [{"role": "system", "content": system}] + step_messages,
                 temperature=0.3,
                 tools=payload or None,
             )
@@ -485,7 +704,12 @@ async def _run_sub_agent(
                     # out-of-role call must not run.
                     result = {"ok": False, "error": f"Tool not available to this role: {name}"}
                 else:
-                    result = await registry.execute(ctx, name, parsed)
+                    intercepted = repeat.intercept(name, parsed)
+                    if intercepted is not None:
+                        result = intercepted
+                    else:
+                        result = await registry.execute(ctx, name, parsed)
+                        repeat.record(name, parsed, result)
                 session_log.append_event(
                     ctx.session_id,
                     session_log.TOOL_RESULT,
@@ -504,6 +728,12 @@ async def _run_sub_agent(
                 result_text = json.dumps(result, ensure_ascii=False, default=str)
                 if len(result_text) > session_log.TOOL_RESULT_TRUNCATE:
                     result_text = result_text[: session_log.TOOL_RESULT_TRUNCATE] + session_log.TRUNCATE_NOTE
+                # Thrash killer — same net as run_turn.
+                if isinstance(result, dict) and result.get("ok") is False:
+                    fail_streak += 1
+                elif isinstance(result, dict):
+                    fail_streak = 0
+                result_text += apply_fail_streak(result, fail_streak)
                 messages.append(
                     {"role": "tool", "tool_call_id": call_id, "content": result_text}
                 )
@@ -517,8 +747,16 @@ async def _run_sub_agent(
                         "content": "",
                     }
                 )
+                # ask_user pauses the whole swarm: the question card waits for
+                # the user's answer; later tasks may depend on it. The loop
+                # must not burn its remaining steps polling.
+                if isinstance(result, dict) and result.get("awaiting_user_input"):
+                    return _PAUSED_PREFIX + (result.get("question") or "question asked")
         else:
-            final = "Reached step budget."
+            final = (
+                "Reached step budget. Here is where things stand — the goal "
+                "may be partially complete."
+            )
     finally:
         await client.close()
     return final or "Done."

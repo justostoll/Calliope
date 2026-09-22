@@ -1,6 +1,6 @@
 # Calliope
 
-Calliope is a local-first story-to-video studio. You type a story idea; Calliope drafts a storyline with beats, characters, and locations, writes a per-scene script, then generates a video clip per scene by driving your own ComfyUI install. When the clips are done, one click stitches them into a finished film with crossfades and matched loudness (ffmpeg). Everything runs on your machine: projects live in SQLite, media lives in folders, and no cloud service is involved beyond the LLM endpoint you point it at.
+Calliope is a local-first story-to-video studio. You type a story idea; Calliope drafts a storyline with beats, characters, and locations, writes a screenplay-faithful per-scene script, then **breaks each scene into shot clips** and generates one video per clip by driving your own ComfyUI install. When the clips are done, one click stitches them into a finished film with crossfades and matched loudness (ffmpeg). Everything runs on your machine: projects live in SQLite, media lives in folders, and no cloud service is involved beyond the LLM endpoint you point it at.
 
 <img width="2003" height="1093" alt="Screenshot 2026-09-06 050058" src="https://github.com/user-attachments/assets/27771fac-3ad2-47c3-9d4a-78cfa6f41f91" />
 
@@ -9,7 +9,7 @@ Calliope is a local-first story-to-video studio. You type a story idea; Calliope
 
 <img width="1508" height="1131" alt="Screenshot 2026-08-23 192042" src="https://github.com/user-attachments/assets/61cb10fb-a8a2-4096-beff-e504a8f7c8df" />
 
-<img width="1847" height="1177" alt="Screenshot 2026-08-23 231317" src="https://github.com/user-attachments/assets/4c1ccac3-39f0-4704-a129-6fc5b5039415" />
+<img width="1976" height="1154" alt="Screenshot 2026-09-13 025721" src="https://github.com/user-attachments/assets/b58fcecf-b6be-41ac-91d8-9f0df2fd8f21" />
 
 
 
@@ -76,12 +76,14 @@ The app walks a project through four stages — **Story, Assets, Script, Video**
 
 - **Story:** describe your idea and **Draft Storyline** — this opens a project-linked chat in the Agents view with the prompt pre-filled, and the agent writes beats, characters, locations, and misc. items. Edit anything by hand before moving on.
 - **Assets:** each character, location, and item has its own **Image prompt**. Pick a workflow and shared settings (width/height/etc.) at the top, then click Generate per entity to produce reference images on your ComfyUI. Regenerate any single entity without touching the others.
-- **Script:** **Regenerate Script** also opens a project-linked Agents chat (pre-filled) to rewrite the per-scene script. Scenes link back to the characters and locations from the Story stage.
-- **Video:** each scene gets a **Generate** button that queues a clip job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs). Scenes marked **Continue from previous video** in Script extend the previous clip instead of cutting fresh — see [Continue from previous clip (video extend)](#continue-from-previous-clip-video-extend).
-- **Film view:** once scenes have clips, **Export film** stitches them with ffmpeg: clips are normalized to 1080p at the **majority frame rate of the clips themselves** (24 fps clips export at 24 fps; mixed-rate projects conform to whichever rate most clips use), joined with 0.5s crossfades, and loudness-normalized into one final file.
+- **Script:** **Regenerate Script** also opens a project-linked Agents chat (pre-filled) to rewrite the per-scene script. Scenes preserve the full screenplay: complete action prose and verbatim dialogue. Then **Break into shots** splits a scene into its shot clips — an LLM coverage pass allocates every dialogue line and action beat across clips of ~5–10 seconds (a 2-minute dialogue scene becomes a dozen clips, not one). Scenes link back to the characters and locations from the Story stage.
+- **Video:** each clip gets rendered by a **Generate** pass that queues a job on ComfyUI with the right prompt and reference images (plus optional video/audio file refs). Clips marked **Continue from previous clip** extend the previous clip instead of cutting fresh — see [Continue from previous clip (video extend)](#continue-from-previous-clip-video-extend).
+- **Film view:** once clips are rendered, **Export film** stitches them with ffmpeg: clips are normalized to 1080p at the **majority frame rate of the clips themselves** (24 fps clips export at 24 fps; mixed-rate projects conform to whichever rate most clips use), joined with 0.5s crossfades, and loudness-normalized into one final file.
 - When everything is done the project is automatically marked **Completed**.
 
 **Playground** is a free-form generation page outside the project pipeline: run any imported workflow with arbitrary inputs, upload your own files (image / video / audio) as inputs, and optionally attach a result to a project as an asset.
+
+**Build Scene** is a browser-based shot composer for blocking out cinematic shots before generating AI images or video. One composition model (`scene_json`) drives both preview and export, and the **Three.js viewport is the single surface**: it previews the scene, captures stills, and exports video (one deterministic `MediaRecorder` pass of the object keyframes + camera track, then normalized server-side to **H.264 MP4 via ffmpeg** so the Playground "From Build Scene" picker always receives a real MP4). **Camera framing is the user's job** — keyed from the timeline — while the agent animates objects through the `shot_*` keyframe tools. There are **no camera-beat tools** and **no ComfyUI** in this surface; agent gates (**Brief** before mutate, **Cut** before export) keep the agent honest. Scenes are managed like AI Canvas chats: a left rail holds compositions bound to agent sessions, and the agent panel drives the same scene through built-in `shot_*` tools (no MCP).
 
 **Agents** is a chat-driven way to run the same pipeline: talk to a production agent that operates Calliope through tools (create project, draft story, write script, queue asset/video renders, watch jobs). Every chat session is bound to at most one project — start a **Sandbox** chat with no project and the agent materializes one via `create_project`, linking the session automatically; or link a session to an existing project and ask for edits. Complex builds are decomposed by a planner into sub-agents (story → script → assets → video). Everything the agent does goes through the same database and render queue the project UI reads — nothing bypasses the normal pipeline. When the agent waits on renders (`wait_for_jobs`), it uses the same **Poll timeout** as the queue worker (default 30 minutes).
 
@@ -152,32 +154,32 @@ For multi-reference workflows, generic `(Input:image)` inputs are filled in **no
 
 ### Continue from previous clip (video extend)
 
-Long takes don't have to be one giant generation. Mark a scene **Continue from previous video** in the **Script** stage and instead of cutting a fresh clip, it extends the previous scene's clip as real continuation footage (the first scene can't use the toggle).
+Long takes don't have to be one giant generation. Mark a clip **Continue from previous clip** in the **Script** stage (the toggle lives on a scene when it hasn't been expanded — expanding migrates it onto the clip) and instead of cutting a fresh clip, it extends the previous clip in the timeline as real continuation footage (the first clip can't use the toggle).
 
-The **Video** stage enforces one requirement: the scene's workflow must have an input tagged `(Input:video)` (a `LoadVideo` node). Continue scenes on a workflow without one have Generate disabled with a warning.
+The **Video** stage enforces one requirement: the workflow must have an input tagged `(Input:video)` (a `LoadVideo` node). Continue clips on a workflow without one have Generate disabled with a warning.
 
 When the workflow qualifies, a **clip source picker** appears on the continue scene:
 
-- **Auto** (default) — the previous scene's clip is used, resolved when the job actually runs.
+- **Auto** (default) — the previous clip in timeline order is used, resolved when the job actually runs.
 - **Upload file** — extend from any video you provide (a Playground upload).
-- **From timeline** — pick a specific earlier scene's clip explicitly.
+- **From timeline** — pick a specific earlier clip explicitly.
 
-Auto is safe even when scenes are queued in one batch: Calliope's queue renders one job at a time, so by the time a continue scene runs, the scene before it has already rendered and its clip is picked up automatically.
+Auto is safe even when clips are queued in one batch: Calliope's queue renders one job at a time, so by the time a continue clip runs, the clip before it has already rendered and is picked up automatically.
 
 The workflow pattern (per [kat3ri/ComfyUI-MiniMax-H3-Extend](https://github.com/kat3ri/ComfyUI-MiniMax-H3-Extend)) is a `LoadVideo (Input:video)` node feeding the MiniMax H3 extend patched nodes (`MiniMaxH3EncodeAVPatched` → `MiniMaxH3VideoExtendPatched`) with the `(Output:video)` node at the end. Recommended starting settings from that repo: `context_frames` **2**, `ref_spacing` **1–2**, `ref_decay` **0.3**, `ref_ramp` **3–4** (5–6 if the prior clip had heavy motion).
 
 ### Review the prompt before you generate
 
-Generate no longer fires blind. Hitting **Generate clip** first opens a prompt preview: the exact text that will land on the workflow's `(Input:prompt)` node — your saved draft if there is one, otherwise a fresh MiniMax H3 rewrite (six-section format) or the prose scene prompt.
+Generate no longer fires blind. Hitting **Generate** first opens a prompt preview: the exact text that will land on the workflow's `(Input:prompt)` node — your saved draft if there is one, otherwise a fresh MiniMax H3 rewrite (six-section format) or the prose clip prompt (scene heading, the clip's shot description, and only the dialogue lines that clip performs).
 
 - **Edit it inline** — typos, camera notes, pacing, anything. The edited text is what gets sent.
 - **Regenerate** re-runs the H3 rewrite for a different take.
-- **Save draft** keeps it on the scene; future generates (single or **Generate all**) reuse the draft instead of calling the LLM again. A hint appears when the draft predates changes to the scene.
+- **Save draft** keeps it on the clip; future generates (single or **Generate all**) reuse the draft instead of calling the LLM again. A hint appears when the draft predates changes to the scene or clip.
 - **Cancel** aborts with nothing enqueued.
 
 After a render, **View prompt & inputs** opens the scene's render history: every job as a chip, the payload each one actually sent to ComfyUI, and **Copy settings to form** to pull a past job's input values back into the live form.
 
-Your video-stage setup (workflow choice, input values, clip source) auto-saves per scene and comes back after a reload or app restart. **Generate all** honors every scene's saved setup and drafts — the toast reports how many drafts were used.
+Your video-stage setup (workflow choice, input values, clip source) auto-saves and comes back after a reload or app restart. **Generate all** honors every saved setup and draft — the toast reports how many drafts were used.
 
 ### Better ComfyUI errors
 
@@ -216,4 +218,3 @@ calliope-web/                SvelteKit frontend
 example_ComfyUI_workflows/   ready-to-import API-format workflow JSONs
 docs/wiki/                   design notes (wiki source): ComfyUI HTTP vs MCP, multi-ref workflows
 ```
-

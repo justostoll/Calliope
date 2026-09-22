@@ -30,6 +30,10 @@ class LLMTruncatedError(ValueError):
 # else (401, 429, 5xx) is a real error and re-raises.
 _STREAM_UNSUPPORTED_STATUS = frozenset({400, 404, 405, 501})
 
+# Set when an endpoint rejects multimodal image parts — later calls in this
+# process skip the parts-provision step entirely (text-only fallback).
+_TEXT_ONLY_ENDPOINTS: set[str] = set()
+
 
 _PROTECTED_PAYLOAD_KEYS = frozenset({"model", "messages", "stream"})
 
@@ -46,6 +50,42 @@ def _merge_extra_body(payload: dict[str, Any], extra_body: dict[str, Any] | None
         if key in _PROTECTED_PAYLOAD_KEYS:
             continue
         payload[key] = value
+
+
+def _strip_image_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of the messages with image_url content parts removed.
+
+    User messages whose content is a part-list collapse to their text part;
+    text-only content passes through untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not (isinstance(content, list) and any(p.get("type") == "image_url" for p in content)):
+            out.append(msg)
+            continue
+        text = " ".join(
+            str(p.get("text") or "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+        ).strip()
+        out.append({**msg, "content": text})
+    return out
+
+
+def _has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
+        for m in messages
+    )
+
+
+def _looks_like_image_rejection(status_code: int, body: str) -> bool:
+    """Heuristic for HTTP 400s caused by image parts on a text-only endpoint."""
+    if status_code != 400:
+        return False
+    lowered = (body or "").lower()
+    markers = ("image", "multimodal", "vision", "content part", "image_url")
+    return any(marker in lowered for marker in markers)
 
 
 class LLMClient:
@@ -66,6 +106,9 @@ class LLMClient:
         # server still fails fast. Shorter timeouts (e.g. the 30 s preview
         # path) trade headroom for a snappier deterministic fallback.
         self.client = httpx.AsyncClient(timeout=timeout)
+        # Flipped when the endpoint rejects image content parts; also tracked
+        # process-wide per base_url so new clients start with the knowledge.
+        self._text_only = self.base_url in _TEXT_ONLY_ENDPOINTS
 
     @classmethod
     def for_role(cls, role: str, *, timeout: float = 120.0) -> LLMClient:
@@ -200,8 +243,31 @@ class LLMClient:
 
         Servers that reject the tools field get it dropped in-stream (the reply
         will have no tool_calls); servers that reject streaming itself get one
-        plain blocking call.
+        plain blocking call. Endpoints that reject image content parts get one
+        text-only retry and are remembered as text-only for the process.
         """
+        if self._text_only or not _has_image_parts(messages):
+            return await self._chat_with_tools_impl(messages, temperature, tools, tool_choice)
+        try:
+            return await self._chat_with_tools_impl(messages, temperature, tools, tool_choice)
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:500] if exc.response is not None else ""
+            if not _looks_like_image_rejection(exc.response.status_code, body):
+                raise
+            logger.warning("Endpoint rejected image parts (%s); retrying text-only", body[:200])
+            self._text_only = True
+            _TEXT_ONLY_ENDPOINTS.add(self.base_url)
+            return await self._chat_with_tools_impl(
+                _strip_image_parts(messages), temperature, tools, tool_choice
+            )
+
+    async def _chat_with_tools_impl(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.7,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []

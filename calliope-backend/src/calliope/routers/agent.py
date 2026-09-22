@@ -17,12 +17,23 @@ router = APIRouter()
 class SessionCreate(BaseModel):
     title: str = "New chat"
     project_id: int | None = None
+    # WHERE the session was born: 'chat' (AI Canvas etc., default) or 'scene'
+    # (Build Scene's per-scene sessions). Scene-origin sessions are excluded
+    # from the generic session list so they never appear in the AI Canvas rail.
+    origin: str = "chat"
 
     @field_validator("title")
     @classmethod
     def _bound_title(cls, v: str) -> str:
         if len(v) > 300:
             raise ValueError("Title too long (max 300 characters)")
+        return v
+
+    @field_validator("origin")
+    @classmethod
+    def _bounded_origin(cls, v: str) -> str:
+        if v not in ("chat", "scene"):
+            raise ValueError("origin must be 'chat' or 'scene'")
         return v
 
 
@@ -59,7 +70,7 @@ class MessageMention(BaseModel):
 class MessageAttachment(BaseModel):
     path: str = Field(min_length=1, max_length=2000)
     name: str = Field(default="", max_length=500)
-    kind: Literal["image", "video", "audio"] = "image"
+    kind: Literal["image", "video", "audio", "document"] = "image"
 
 
 class MemoryCreate(BaseModel):
@@ -156,18 +167,34 @@ def _rows_to_messages(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @router.get("/sessions")
-async def list_sessions(project_id: int | None = None) -> list[dict[str, Any]]:
+async def list_sessions(
+    project_id: int | None = None,
+    origin: str | None = None,
+    include_scene: bool = False,
+) -> list[dict[str, Any]]:
+    """Sessions for the sidebars. Scene-origin sessions (Build Scene's
+    per-scene chats) are excluded unless asked for by origin or flag — they
+    are Build Scene's rail entries, not AI Canvas chats."""
     conn = get_db(settings.db_path)
     try:
+        where: list[str] = []
+        params: list[Any] = []
         if project_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM agent_sessions WHERE project_id = ? ORDER BY updated_at DESC",
-                (project_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM agent_sessions ORDER BY updated_at DESC"
-            ).fetchall()
+            where.append("project_id = ?")
+            params.append(project_id)
+        if not include_scene:
+            # origin=scene is compatible with include_scene for clarity; a
+            # direct origin filter wins (Build Scene asks by origin).
+            if origin is not None:
+                where.append("origin = ?")
+                params.append(origin)
+            else:
+                where.append("origin != 'scene'")
+        sql = "SELECT * FROM agent_sessions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC"
+        rows = conn.execute(sql, params).fetchall()
         out = []
         for r in rows:
             s = _session_out(conn, r)
@@ -188,8 +215,8 @@ async def create_session(payload: SessionCreate) -> dict[str, Any]:
             ).fetchone():
                 raise HTTPException(status_code=404, detail="Project not found")
         cur = conn.execute(
-            "INSERT INTO agent_sessions (title, project_id) VALUES (?, ?)",
-            (payload.title, payload.project_id),
+            "INSERT INTO agent_sessions (title, project_id, origin) VALUES (?, ?, ?)",
+            (payload.title, payload.project_id, payload.origin),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM agent_sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -248,7 +275,24 @@ async def patch_session(session_id: int, payload: SessionPatch) -> dict[str, Any
             raise HTTPException(status_code=404, detail="Session not found")
         if runner.is_running(session_id):
             raise HTTPException(status_code=409, detail="Session is running")
+        if payload.unlink:
+            conn.execute(
+                "UPDATE agent_sessions SET project_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+        elif payload.project_id is not None:
+            if not conn.execute(
+                "SELECT id FROM projects WHERE id = ?", (payload.project_id,)
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="Project not found")
+            conn.execute(
+                "UPDATE agent_sessions SET project_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (payload.project_id, session_id),
+            )
         if payload.title is not None:
+            # Renaming must never change WHERE the session is listed: origin is
+            # fixed at creation (the old title-prefix check made a rename break
+            # Build Scene's rail; origin cannot drift, titles can).
             conn.execute(
                 "UPDATE agent_sessions SET title = ? WHERE id = ?",
                 (payload.title, session_id),
@@ -325,9 +369,38 @@ async def post_message(session_id: int, payload: MessageCreate) -> dict[str, Any
             answer_to=payload.answer_to,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Session mid-turn: the message becomes steering, not a rejection.
+        # The running loop drains steering/message events between steps and
+        # injects them into its request history — the user course-corrects
+        # without killing the run (Stop stays available for a hard stop).
+        # Answering a question card while running stays a 409: the answer
+        # belongs to the NEXT turn, which starts when this one ends.
+        if payload.answer_to is not None:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        steered = await runner.steer(
+            session_id,
+            content,
+            mentions=mentions or None,
+            attachments=attachments or None,
+        )
+        if steered is None:
+            # Lost the running race (turn ended between the two checks) —
+            # fall through to a normal turn so the message is never lost.
+            try:
+                user_msg = await runner.start_turn(
+                    session_id,
+                    content,
+                    mentions=mentions or None,
+                    attachments=attachments or None,
+                )
+            except RuntimeError as re_exc:
+                raise HTTPException(status_code=409, detail=str(re_exc)) from re_exc
+            except ValueError as ve:
+                raise HTTPException(status_code=404, detail=str(ve)) from ve
+            return {"ok": True, "message": user_msg}
+        return {"ok": True, "steered": True, "message": steered}
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Session not found") from exc
     return {"ok": True, "message": user_msg}
 
 

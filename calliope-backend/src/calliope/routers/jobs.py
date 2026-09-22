@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from calliope.agent.video_agent import enqueue_video_jobs, preview_scene_prompt
+from calliope.agent.video_agent import enqueue_video_jobs, preview_clip_prompt
 from calliope.comfyui.client import ComfyUIClient
 from calliope.config import settings
 from calliope.db import get_db
@@ -65,6 +65,7 @@ async def generate_videos(
         jobs = await enqueue_video_jobs(
             project_id,
             scene_ids=body.scene_ids,
+            clip_ids=body.clip_ids,
             workflow_id=body.workflow_id,
             input_values_override=body.input_values,
             prompts=body.prompts,
@@ -77,9 +78,26 @@ async def generate_videos(
 @router.post("/projects/{project_id}/preview-prompt")
 async def preview_prompt(project_id: int, payload: PreviewPromptRequest) -> dict[str, Any]:
     """HITL review step: the exact prompt a Generate would send, no enqueue."""
+    clip_id = payload.clip_id
+    if clip_id is None and payload.scene_id is None:
+        raise HTTPException(status_code=400, detail="clip_id or scene_id required")
+    if clip_id is None:
+        # Legacy scene addressing resolves to the scene's default (first) clip.
+        conn = get_db(settings.db_path)
+        try:
+            row = conn.execute(
+                "SELECT id FROM clips WHERE scene_id = ? AND project_id = ? "
+                "ORDER BY order_index, id LIMIT 1",
+                (payload.scene_id, project_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scene has no clips")
+        clip_id = int(row["id"])
     try:
-        return await preview_scene_prompt(
-            project_id, payload.scene_id, workflow_id=payload.workflow_id
+        return await preview_clip_prompt(
+            project_id, clip_id, workflow_id=payload.workflow_id
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -90,13 +108,13 @@ async def export_film(project_id: int) -> dict[str, Any]:
     conn = get_db(settings.db_path)
     try:
         row = conn.execute(
-            "SELECT COUNT(*) AS n FROM scenes WHERE project_id = ? AND video_path IS NOT NULL",
+            "SELECT COUNT(*) AS n FROM clips WHERE project_id = ? AND clip_path IS NOT NULL",
             (project_id,),
         ).fetchone()
         if not row or row["n"] == 0:
             raise HTTPException(
                 status_code=400,
-                detail="No scene clips to export — generate videos first",
+                detail="No clips to export — generate videos first",
             )
         # Supersede leftover pending exports so a re-Export always starts fresh
         conn.execute(
@@ -131,6 +149,7 @@ async def create_job(payload: JobCreate, project_id: int = Query(...)) -> dict[s
         kind=payload.kind,
         workflow_id=payload.workflow_id,
         scene_id=payload.scene_id,
+        clip_id=payload.clip_id,
         payload={
             "input_values": payload.input_values or {},
             "character_id": payload.character_id,

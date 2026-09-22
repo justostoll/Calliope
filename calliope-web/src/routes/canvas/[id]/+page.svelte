@@ -25,6 +25,8 @@
 	import EntityNode from '$lib/canvas/EntityNode.svelte';
 	import ArtifactNodeComp from '$lib/canvas/ArtifactNode.svelte';
 	import Icon from '$lib/components/ui/Icon.svelte';
+	import { t } from '$lib/i18n.svelte';
+	import { storageGet, storageSet } from '$lib/storage';
 	import {
 		agentApi,
 		assetUrl,
@@ -51,7 +53,7 @@
 
 	const canvasId = Number(page.params.id);
 	if (!Number.isFinite(canvasId)) {
-		throw new Error('Invalid canvas id');
+		throw new Error(t('canvas.invalidId'));
 	}
 
 	const RAIL_KEY = 'calliope.canvas.railCollapsed';
@@ -106,10 +108,18 @@
 		}
 		if (node.entity_type === 'scene') {
 			const s = scenes.find((x) => x.id === node.entity_id);
-			// Project > Videos pattern: env image poster, clip fallback; only
-			// real video files count (guard mirrors QueueStage.previewPath).
-			const clip =
-				s?.video_path && /\.(mp4|webm)$/i.test(s.video_path) ? s.video_path : null;
+			// Project > Videos pattern: env image poster, first ready clip
+			// fallback; only real video files count (guard mirrors
+			// QueueStage.previewPath). A scene's clips are the renderables —
+			// the card plays the scene's first ready clip.
+			const firstReady = (s?.clips ?? []).find(
+				(c) => c.clip_path && /\.(mp4|webm)$/i.test(c.clip_path),
+			);
+			const clip = firstReady?.clip_path
+				? firstReady.clip_path
+				: s?.video_path && /\.(mp4|webm)$/i.test(s.video_path)
+					? s.video_path
+					: null;
 			return { imagePath: s?.env_image_path ?? null, videoPath: clip };
 		}
 		return { imagePath: null, videoPath: null };
@@ -225,7 +235,7 @@
 				y: node.position.y,
 			});
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not save position');
+			toast.error(err instanceof Error ? err.message : t('canvas.savePosFailed'));
 		}
 	}
 
@@ -255,6 +265,62 @@
 		if (rebuildPending) {
 			void client.refetchQueries({ queryKey: ['canvas', canvasId] });
 			rebuildPending = false;
+		}
+	}
+
+	// ---- node deletion (Backspace/Delete on selection) ----------------------
+	// Svelte Flow removes deleted nodes from the local store on its own; the
+	// handlers below make the removal real (persist + file cleanup) or veto it.
+
+	function nodeServerId(node: Node): number | null {
+		const id = (node.data as { canvasNodeId?: number }).canvasNodeId;
+		return typeof id === 'number' ? id : null;
+	}
+
+	async function onBeforeDeleteCanvas({ nodes }: { nodes: Node[] }): Promise<boolean> {
+		const blocked = nodes.filter(
+			(n) =>
+				n.type === 'entity' ||
+				(n.data as { status?: string }).status === 'running' ||
+				(n.data as { status?: string }).status === 'queued',
+		);
+		if (blocked.length > 0) {
+			toast.error(
+				t('canvas.deleteBlocked', { count: blocked.length }),
+			);
+			return false;
+		}
+		return true;
+	}
+
+	async function onDeleteCanvas({ nodes }: { nodes: Node[] }) {
+		const ids = nodes
+			.map(nodeServerId)
+			.filter((id): id is number => id != null);
+		if (ids.length === 0) return;
+		let fileDeletedCount = 0;
+		let keptCount = 0;
+		const results = await Promise.allSettled(
+			ids.map((id) => canvasApi.deleteNode(canvasId, id)),
+		);
+		for (const r of results) {
+			if (r.status === 'fulfilled') {
+				if (r.value.file_deleted) fileDeletedCount++;
+				else keptCount++;
+			}
+		}
+		await client.invalidateQueries({ queryKey: ['canvas', canvasId] });
+		const failed = results.filter((r) => r.status === 'rejected').length;
+		if (failed > 0) {
+			toast.error(t('canvas.deleteFailed'));
+			return;
+		}
+		if (fileDeletedCount > 0 && keptCount > 0) {
+			toast.success(t('canvas.deletedMixed', { files: fileDeletedCount, kept: keptCount }));
+		} else if (fileDeletedCount > 0) {
+			toast.success(t('canvas.deletedWithFile', { count: fileDeletedCount }));
+		} else {
+			toast.success(t('canvas.deletedCardOnly', { count: keptCount }));
 		}
 	}
 
@@ -288,10 +354,10 @@
 	}
 
 	function restoreViewportFromStorage(): Viewport | null {
-		if (typeof localStorage === 'undefined') return null;
+		const raw = storageGet(viewportLocalStorageKey(canvasId));
+		if (raw == null) return null;
 		try {
-			const raw = localStorage.getItem(viewportLocalStorageKey(canvasId));
-			return raw ? (JSON.parse(raw) as Viewport) : null;
+			return JSON.parse(raw) as Viewport;
 		} catch {
 			return null;
 		}
@@ -304,11 +370,7 @@
 			const json = JSON.stringify(v);
 			// localStorage first (synchronous, survives navigation + reloads
 			// even if the request never lands), backend per canvas second.
-			try {
-				localStorage.setItem(viewportLocalStorageKey(canvasId), json);
-			} catch {
-				// storage full/blocked — backend save still applies
-			}
+			storageSet(viewportLocalStorageKey(canvasId), json);
 			void canvasApi
 				.patchCanvas(canvasId, { viewport_json: json })
 				.catch(() => undefined);
@@ -352,6 +414,9 @@
 	let activeId = $state<number | null>(null);
 	let streaming = $state('');
 	let streamingReasoning = $state('');
+	// Tracks which agent produced the last reasoning delta so the name prefix
+	// is written once per transition, not per token.
+	let thinkingAgent: string | null = null;
 	let liveTools = $state<
 		{ tool: string; args?: Record<string, unknown> | null; result?: unknown; phase: 'running' | 'done' | 'error' }[]
 	>([]);
@@ -421,8 +486,14 @@
 		sessionScopeHandled = true;
 		const paramSession = page.url.searchParams.get('session');
 		const pid = Number(paramSession);
-		if (paramSession != null && Number.isFinite(pid)) {
-			activeId = sessions.some((s) => s.id === pid) ? pid : null;
+		if (paramSession != null && Number.isFinite(pid) && pid > 0) {
+			// Trust the deep-link param even when the (possibly cached) sessions
+			// list doesn't contain it yet: /agents?project=&task= hands us a
+			// session created milliseconds ago. Validating against a stale list
+			// nulled activeId and orphaned the chat — the next Send then created
+			// a DUPLICATE session (empty 905 vs working 906 signature). A truly
+			// gone session just 404s in the session query, which is recoverable.
+			activeId = pid;
 			// Deep-link handoff (/agents?project=&task=) pre-fills the composer once.
 			const prefill = sessionStorage.getItem('calliope.canvas.composerPrefill');
 			if (prefill) {
@@ -432,7 +503,7 @@
 			replaceUrlParam('session');
 			return;
 		}
-		const stored = Number(localStorage.getItem(SESSION_KEY));
+		const stored = Number(storageGet(SESSION_KEY));
 		if (Number.isFinite(stored) && sessions.some((s) => s.id === stored)) {
 			const s = sessions.find((x) => x.id === stored)!;
 			if ((s.project_id ?? null) === (canvas.project_id ?? null)) {
@@ -479,13 +550,14 @@
 				: await canvasApi.ensureForSession(s.id);
 			goto(`/canvas/${graph.canvas.id}?session=${s.id}`);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not open that canvas');
+			toast.error(err instanceof Error ? err.message : t('canvas.openThatFailed'));
 		}
 	}
 
 	function resetLiveViews() {
 		streaming = '';
 		streamingReasoning = '';
+		thinkingAgent = null;
 		liveTools = [];
 		livePlan = null;
 		composerDraft = '';
@@ -510,7 +582,7 @@
 			const graph = await canvasApi.ensureForSession(s.id);
 			goto(`/canvas/${graph.canvas.id}?session=${s.id}`);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not create session');
+			toast.error(err instanceof Error ? err.message : t('canvas.sessionCreateFailed'));
 		}
 	}
 
@@ -527,19 +599,19 @@
 				goto(`/canvas/${graph.canvas.id}?session=${s.id}`);
 			}
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not create session');
+			toast.error(err instanceof Error ? err.message : t('canvas.sessionCreateFailed'));
 		}
 	}
 
 	async function removeSession(id: number) {
-		if (!confirm('Delete this chat and its message history?')) return;
+		if (!confirm(t('canvas.confirmDeleteChat'))) return;
 		try {
 			await agentApi.deleteSession(id);
 			if (activeId === id) activeId = null;
 			await client.invalidateQueries({ queryKey: ['agent-sessions'] });
-			toast.success('Session deleted');
+			toast.success(t('canvas.sessionDeleted'));
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not delete session');
+			toast.error(err instanceof Error ? err.message : t('canvas.sessionDeleteFailed'));
 		}
 	}
 
@@ -559,24 +631,29 @@
 			// Follow the chat to its sandbox canvas (created on demand).
 			const graph = await canvasApi.ensureForSession(sid);
 			goto(`/canvas/${graph.canvas.id}?session=${sid}`);
-			toast.success('Chat unlinked — moved to Sandbox');
+			toast.success(t('canvas.chatUnlinked'));
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Unlink failed');
+			toast.error(err instanceof Error ? err.message : t('canvas.unlinkFailed'));
 		}
 	}
 
 	const sendMutation = createMutation({
 		mutationFn: (payload: AgentComposerPayload) => agentApi.postMessage(activeId!, payload),
 		onMutate: () => {
-			streaming = '';
-			streamingReasoning = '';
-			liveTools = [];
-			livePlan = null;
 			if (activeId != null) {
-				client.setQueryData<AgentSession & { messages: AgentMessage[]; plan?: AgentPlan | null }>(
-					['agent-session', activeId],
-					(old) => (old ? { ...old, plan: null } : old),
-				);
+				const s = sessions.find((x) => x.id === activeId);
+				const steering = Boolean(s?.running || s?.status === 'running');
+				if (!steering) {
+					streaming = '';
+					streamingReasoning = '';
+					thinkingAgent = null;
+					liveTools = [];
+					livePlan = null;
+					client.setQueryData<AgentSession & { messages: AgentMessage[]; plan?: AgentPlan | null }>(
+						['agent-session', activeId],
+						(old) => (old ? { ...old, plan: null } : old),
+					);
+				}
 			}
 		},
 		onSuccess: async () => {
@@ -584,7 +661,7 @@
 			await client.invalidateQueries({ queryKey: ['agent-sessions'] });
 		},
 		onError: (err) => {
-			toast.error(err instanceof Error ? err.message : 'Failed to send');
+			toast.error(err instanceof Error ? err.message : t('canvas.sendFailed'));
 		},
 	});
 
@@ -597,9 +674,9 @@
 			// so the composer leaves its running state immediately.
 			await client.invalidateQueries({ queryKey: ['agent-sessions'] });
 			await client.invalidateQueries({ queryKey: ['agent-session', activeId] });
-			toast.info('Run cancelled');
+			toast.info(t('canvas.runCancelled'));
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Cancel failed');
+			toast.error(err instanceof Error ? err.message : t('canvas.cancelFailed'));
 		}
 	}
 
@@ -614,7 +691,7 @@
 			activeId = s.id;
 			$sendMutation.mutate(payload);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Could not create session');
+			toast.error(err instanceof Error ? err.message : t('canvas.sessionCreateFailed'));
 		}
 	}
 
@@ -674,6 +751,7 @@
 						if (msg.role === 'assistant' && !msg.agent_name) {
 							streaming = '';
 							streamingReasoning = '';
+							thinkingAgent = null;
 						}
 					}
 				}
@@ -683,7 +761,16 @@
 					streaming += String(ev.data?.content ?? '');
 				}
 			} else if (ev.type === 'agent.thinking') {
-				if (ev.data?.session_id === activeId && !ev.data?.agent_name) {
+				// Reasoning is auxiliary: stream it from ANY agent (incl.
+				// sub-agents) — the old `!agent_name` filter left delegated
+				// turns as a bare "working..." card. Prefix only on agent
+				// change; deltas arrive per token.
+				if (ev.data?.session_id === activeId) {
+					const name = (ev.data?.agent_name as string | undefined) ?? null;
+					if (name !== thinkingAgent) {
+						streamingReasoning += `${name ? `${name}: ` : ''}`;
+						thinkingAgent = name;
+					}
 					streamingReasoning += String(ev.data?.content ?? '');
 				}
 			} else if (ev.type === 'agent.tool') {
@@ -841,28 +928,24 @@
 		try {
 			const res = await canvasApi.tidy(canvasId);
 			await client.invalidateQueries({ queryKey: ['canvas', canvasId] });
-			toast.success(`Tidied ${res.moved} cards into columns`);
+			toast.success(t('canvas.tidied', { count: res.moved }));
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Tidy failed');
+			toast.error(err instanceof Error ? err.message : t('canvas.tidyFailed'));
 		} finally {
 			tidying = false;
 		}
 	}
 
-	let railCollapsed = $state(
-		typeof localStorage !== 'undefined' && localStorage.getItem(RAIL_KEY) === '1',
-	);
-	let chatCollapsed = $state(
-		typeof localStorage !== 'undefined' && localStorage.getItem(CHAT_KEY) === '1',
-	);
+	let railCollapsed = $state(storageGet(RAIL_KEY) === '1');
+	let chatCollapsed = $state(storageGet(CHAT_KEY) === '1');
 
 	function toggleRail() {
 		railCollapsed = !railCollapsed;
-		localStorage.setItem(RAIL_KEY, railCollapsed ? '1' : '0');
+		storageSet(RAIL_KEY, railCollapsed ? '1' : '0');
 	}
 	function toggleChat() {
 		chatCollapsed = !chatCollapsed;
-		localStorage.setItem(CHAT_KEY, chatCollapsed ? '1' : '0');
+		storageSet(CHAT_KEY, chatCollapsed ? '1' : '0');
 	}
 
 	// ---- draggable chat splitter ---------------------------------------------
@@ -881,7 +964,7 @@
 	}
 
 	$effect(() => {
-		const raw = Number(localStorage.getItem(CHAT_W_KEY));
+		const raw = Number(storageGet(CHAT_W_KEY));
 		if (Number.isFinite(raw) && raw > 0) chatWidth = clampChatWidth(raw);
 		// Keep the panel within the cap when the window shrinks.
 		const onResize = () => (chatWidth = clampChatWidth(chatWidth));
@@ -904,7 +987,7 @@
 			dragging = false;
 			document.body.style.userSelect = '';
 			document.body.style.cursor = '';
-			localStorage.setItem(CHAT_W_KEY, String(Math.round(chatWidth)));
+			storageSet(CHAT_W_KEY, String(Math.round(chatWidth)));
 			document.removeEventListener('mousemove', onMove);
 			document.removeEventListener('mouseup', onUp);
 		};
@@ -932,17 +1015,17 @@
 			savedFlash = true;
 			setTimeout(() => (savedFlash = false), 1400);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : 'Rename failed');
+			toast.error(err instanceof Error ? err.message : t('canvas.renameFailed'));
 		}
 	}
 
 	const SUGGESTIONS: { label: string; prompt: string }[] = [
 		{
-			label: 'Create a new film',
+			label: t('canvas.suggestFilm'),
 			prompt: 'Create a new film project and guide me through drafting the story.',
 		},
 		{
-			label: 'Draft a storyline',
+			label: t('canvas.suggestStory'),
 			prompt: 'Draft a storyline — beats, characters, environments, and misc. items.',
 		},
 	];
@@ -953,7 +1036,7 @@
 
 	{#if $canvasQuery.isError}
 		<div class="load-error" role="alert">
-			Could not load this canvas
+			{t('canvas.loadFailed')}
 			{#if $canvasQuery.error instanceof Error}
 				— {$canvasQuery.error.message}
 			{/if}
@@ -988,7 +1071,7 @@
 							type="button"
 							class="title-btn"
 							onclick={() => (titleEditing = true)}
-							title="Rename canvas"
+							title={t('canvas.rename')}
 						>
 							{canvas.title}
 						</button>
@@ -1006,15 +1089,15 @@
 						class="unlink-btn"
 						onclick={unlinkActiveSession}
 						disabled={!activeSession || running}
-						title={running
-							? 'Wait for the run to finish'
-							: activeSession
-								? `Unlink this chat from ${canvas.project.title}`
-								: 'No chat on this canvas yet'}
-						aria-label={`Unlink this chat from ${canvas.project.title}`}
+title={running
+			? t('canvas.waitFinish')
+			: activeSession
+			? t('canvas.unlinkFrom', { title: canvas.project.title })
+			: t('canvas.noChatYet')}
+						aria-label={t('canvas.unlinkFrom', { title: canvas.project.title })}
 					>
 						<Icon name="link-off" size={12} />
-						Unlink
+						{t('canvas.unlinkButton')}
 					</button>
 				{:else}
 					<span class="sandbox-chip">
@@ -1039,6 +1122,8 @@
 					fitView={initialViewport === undefined}
 					onnodedragstart={onNodeDragStart}
 					onnodedragstop={onNodeDragStop}
+					onbeforedelete={onBeforeDeleteCanvas}
+					ondelete={onDeleteCanvas}
 					onmoveend={(_event, vp) => scheduleViewportSave(vp)}
 					oninit={assertViewportOnInit}
 				>
@@ -1051,20 +1136,17 @@
 							class="tidy-btn"
 							disabled={tidying || nodes.length === 0}
 							onclick={tidyCanvas}
-							title="Re-arrange all cards into clean columns and grids"
+							title={t('canvas.tidyTitle')}
 						>
 							<Icon name="drag" size={14} />
-							Tidy layout
+							{t('canvas.tidy')}
 						</button>
 					</Panel>
 					{#if nodes.length === 0 && !$canvasQuery.isLoading}
 						<Panel position="top-center">
 							<div class="canvas-empty-hint">
-								<strong>Empty board</strong>
-								<span>
-									Ask the agent on the right to create characters, scenes, or to
-									generate an image or video — outputs land here as cards.
-								</span>
+								<strong>{t('canvas.emptyBoard')}</strong>
+								<span>{t('canvas.emptyHint')}</span>
 							</div>
 						</Panel>
 					{/if}
@@ -1076,17 +1158,17 @@
 					type="button"
 					class="chat-splitter"
 					class:dragging
-					aria-label={`Resize chat panel (drag or arrow keys), currently ${Math.round(chatWidth)} pixels`}
+					aria-label={t('canvas.resizePanel', { width: Math.round(chatWidth) })}
 					onmousedown={startDrag}
 					onkeydown={(e) => {
 						if (e.key === 'ArrowLeft') {
 							e.preventDefault();
 							chatWidth = clampChatWidth(chatWidth + 24);
-							localStorage.setItem(CHAT_W_KEY, String(Math.round(chatWidth)));
+							storageSet(CHAT_W_KEY, String(Math.round(chatWidth)));
 						} else if (e.key === 'ArrowRight') {
 							e.preventDefault();
 							chatWidth = clampChatWidth(chatWidth - 24);
-							localStorage.setItem(CHAT_W_KEY, String(Math.round(chatWidth)));
+							storageSet(CHAT_W_KEY, String(Math.round(chatWidth)));
 						}
 					}}
 				></button>
@@ -1096,15 +1178,15 @@
 							{#if activeSession}
 								<span class="chat-title">{activeSession.title}</span>
 							{:else}
-								<span class="chat-title muted">No chat selected</span>
+								<span class="chat-title muted">{t('canvas.noChatSelected')}</span>
 							{/if}
 						</div>
 						<button
 							type="button"
 							class="chat-toggle"
 							onclick={toggleChat}
-							title="Collapse chat"
-							aria-label="Collapse chat"
+							title={t('canvas.collapseChat')}
+							aria-label={t('canvas.collapseChat')}
 						>
 							<Icon name="chevron-right" size={14} />
 						</button>
@@ -1141,8 +1223,8 @@
 					type="button"
 					class="chat-expand"
 					onclick={toggleChat}
-					title="Expand chat"
-					aria-label="Expand chat"
+					title={t('canvas.expandChat')}
+					aria-label={t('canvas.expandChat')}
 				>
 					<Icon name="chevron-left" size={14} />
 				</button>

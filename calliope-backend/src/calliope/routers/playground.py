@@ -118,10 +118,16 @@ UPLOAD_KIND_BY_EXT: dict[str, str] = {
     # .m4a uploads succeed here and land in Comfy's input dir, but some builds
     # reject it at /prompt validation — prefer wav/mp3 for ref audio.
     ".m4a": "audio",
+    # Documents are agent-context material (script uploads projected as text),
+    # never Comfy job inputs — the agent routers' kind validators accept them.
+    ".txt": "document",
+    ".md": "document",
+    ".docx": "document",
 }
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 UPLOAD_MAX_BYTES = 500 * 1024 * 1024  # 500MB
+DOCUMENT_MAX_BYTES = 5 * 1024 * 1024  # 5MB — docs feed the LLM context, not Comfy
 _UPLOAD_PREFIX_RE = re.compile(r"^[0-9a-f]{8}-")
 
 
@@ -256,12 +262,14 @@ async def upload_media(file: UploadFile = File(...)) -> dict[str, Any]:
     dest = uploads / f"{uuid4().hex[:8]}-{_safe_upload_name(original)}"
 
     size = 0
+    max_bytes = DOCUMENT_MAX_BYTES if kind == "document" else UPLOAD_MAX_BYTES
     try:
         with dest.open("wb") as out:
             while chunk := await file.read(UPLOAD_CHUNK_SIZE):
                 size += len(chunk)
-                if size > UPLOAD_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="File too large (max 500MB)")
+                if size > max_bytes:
+                    limit = "5MB" if kind == "document" else "500MB"
+                    raise HTTPException(status_code=413, detail=f"File too large (max {limit})")
                 out.write(chunk)
     except Exception:
         dest.unlink(missing_ok=True)
@@ -284,6 +292,14 @@ async def list_uploaded_media() -> list[dict[str, Any]]:
         if kind is None:
             continue
         stat = f.stat()
+        tags = None
+        sidecar = Path(str(f) + ".meta.json")
+        if sidecar.is_file():
+            try:
+                meta = json.loads(sidecar.read_text(encoding="utf-8"))
+                tags = meta.get("tags") if isinstance(meta, dict) else None
+            except (OSError, json.JSONDecodeError):
+                tags = None
         entries.append(
             (
                 stat.st_mtime,
@@ -293,6 +309,7 @@ async def list_uploaded_media() -> list[dict[str, Any]]:
                     "kind": kind,
                     "size": stat.st_size,
                     "mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    "tags": tags,
                 },
             )
         )

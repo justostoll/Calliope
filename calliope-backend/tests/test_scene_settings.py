@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from calliope.agent.video_agent import enqueue_video_jobs
+from calliope.agent.video_agent import enqueue_video_jobs, preview_clip_prompt
 from calliope.config import settings
 from calliope.db import get_db
 
@@ -15,6 +15,20 @@ def _mk_project(client, title: str) -> int:
 def _add_scene(client, pid: int, order: int, **extra) -> dict:
     payload = {"order_index": order, "heading": f"S{order}", **extra}
     return client.post(f"/api/projects/{pid}/scenes", json=payload).json()
+
+
+def _scene_default_clip(pid: int, scene_id: int) -> int:
+    conn = get_db(settings.db_path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM clips WHERE scene_id = ? AND project_id = ? "
+            "ORDER BY order_index, id LIMIT 1",
+            (scene_id, pid),
+        ).fetchone()
+        assert row is not None
+        return row["id"]
+    finally:
+        conn.close()
 
 
 def test_scene_patch_video_settings_roundtrip(client):
@@ -90,17 +104,18 @@ def _insert_h3_workflow(conn, name: str) -> int:
 
 
 def test_enqueue_merges_stored_input_values(client, monkeypatch):
-    """Batch enqueue with no form values must honor the saved per-scene setup."""
+    """Batch enqueue with no form values must honor the saved per-clip setup."""
     pid = _mk_project(client, "Merge stored")
     scene = _add_scene(client, pid, 1)
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
         wf_id = _insert_h3_workflow(conn, "H3 merge")
         stored = {"input_values": {"20": 10}}
         conn.execute(
-            "UPDATE scenes SET workflow_id = ?, video_settings_json = ? WHERE id = ?",
-            (wf_id, json.dumps(stored), scene["id"]),
+            "UPDATE clips SET workflow_id = ?, video_settings_json = ? WHERE id = ?",
+            (wf_id, json.dumps(stored), clip_id),
         )
         conn.commit()
     finally:
@@ -134,12 +149,13 @@ def test_preview_prompt_endpoint_h3_profile(client, monkeypatch):
 
     pid = _mk_project(client, "Preview H3")
     scene = _add_scene(client, pid, 1)
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
         wf_id = _insert_h3_workflow(conn, "H3 preview")
         conn.execute(
-            "UPDATE scenes SET workflow_id = ? WHERE id = ?", (wf_id, scene["id"])
+            "UPDATE clips SET workflow_id = ? WHERE id = ?", (wf_id, clip_id)
         )
         conn.commit()
     finally:
@@ -154,7 +170,7 @@ def test_preview_prompt_endpoint_h3_profile(client, monkeypatch):
     try:
         r = client.post(
             f"/api/jobs/projects/{pid}/preview-prompt",
-            json={"scene_id": scene["id"]},
+            json={"clip_id": clip_id},
         )
         assert r.status_code == 200
         body = r.json()
@@ -172,41 +188,43 @@ def test_preview_prompt_endpoint_h3_profile(client, monkeypatch):
 
 def test_preview_prompt_fresh_draft_shortcircuits_llm(client, monkeypatch):
     """A saved fresh draft is returned as-is — no LLM call."""
-    from calliope.agent.video_agent import preview_scene_prompt
-
     pid = _mk_project(client, "Preview draft")
     scene = _add_scene(client, pid, 1)
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
         wf_id = _insert_h3_workflow(conn, "H3 draft")
         conn.execute(
-            "UPDATE scenes SET workflow_id = ? WHERE id = ?", (wf_id, scene["id"])
+            "UPDATE clips SET workflow_id = ? WHERE id = ?", (wf_id, clip_id)
         )
         conn.commit()
     finally:
         conn.close()
 
     # Compute the hash the backend would, then store the draft with it
-    from calliope.agent.video_agent import _scene_prompt_hash
+    from calliope.agent.video_agent import _clip_prompt_hash
 
     conn = get_db(settings.db_path)
     try:
         fresh_row = conn.execute(
-            "SELECT * FROM scenes WHERE id = ?", (scene["id"],)
+            """
+            SELECT c.*, s.heading, s.action, s.dialog,
+                   s.order_index AS scene_order_index,
+                   s.env_image_path, s.location_id
+            FROM clips c JOIN scenes s ON s.id = c.scene_id
+            WHERE c.id = ?""",
+            (clip_id,),
         ).fetchone()
-        from calliope.db import row_to_dict
-
-        fresh_scene = row_to_dict(fresh_row)
-        # character_ids aren't on the row — hash treats them via scene dict
-        fresh_scene["character_ids"] = []
+        fresh_clip = dict(fresh_row)
+        fresh_clip["character_ids"] = []
         stored = {
             "prompt_draft": "MY SAVED DRAFT",
-            "prompt_draft_meta": {"based_on": _scene_prompt_hash(fresh_scene)},
+            "prompt_draft_meta": {"based_on": _clip_prompt_hash(fresh_clip)},
         }
         conn.execute(
-            "UPDATE scenes SET video_settings_json = ? WHERE id = ?",
-            (json.dumps(stored), scene["id"]),
+            "UPDATE clips SET video_settings_json = ? WHERE id = ?",
+            (json.dumps(stored), clip_id),
         )
         conn.commit()
     finally:
@@ -220,7 +238,7 @@ def test_preview_prompt_fresh_draft_shortcircuits_llm(client, monkeypatch):
 
     monkeypatch.setattr("calliope.agent.video_agent._h3_rewrite", fake_rewrite)
 
-    result = asyncio_run(preview_scene_prompt(pid, scene["id"]))
+    result = asyncio_run(preview_clip_prompt(pid, clip_id))
     assert result["prompt"] == "MY SAVED DRAFT"
     assert result["from_draft"] is True
     assert called == []  # LLM never invoked
@@ -236,12 +254,13 @@ def test_preview_prompt_dead_llm_returns_deterministic_fallback(client, monkeypa
 
     pid = _mk_project(client, "Preview dead LLM")
     scene = _add_scene(client, pid, 1, action="A lone rider crosses the salt flats.")
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
         wf_id = _insert_h3_workflow(conn, "H3 dead")
         conn.execute(
-            "UPDATE scenes SET workflow_id = ? WHERE id = ?", (wf_id, scene["id"])
+            "UPDATE clips SET workflow_id = ? WHERE id = ?", (wf_id, clip_id)
         )
         conn.commit()
     finally:
@@ -263,7 +282,7 @@ def test_preview_prompt_dead_llm_returns_deterministic_fallback(client, monkeypa
         type("LLMClientStub", (), {"for_role": staticmethod(lambda role, **kw: DeadClient())}),
     )
 
-    result = asyncio_run(video_agent.preview_scene_prompt(pid, scene["id"]))
+    result = asyncio_run(video_agent.preview_clip_prompt(pid, clip_id))
     assert result["profile"] == "minimax_h3_ref"
     assert result["from_draft"] is False
     # Deterministic template content, not an exception and not empty
@@ -278,12 +297,13 @@ def test_enqueue_prompts_override(client, monkeypatch):
     """Confirmed prompt from the review modal wins over the rewrite."""
     pid = _mk_project(client, "Prompt override")
     scene = _add_scene(client, pid, 1)
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
         wf_id = _insert_h3_workflow(conn, "H3 override")
         conn.execute(
-            "UPDATE scenes SET workflow_id = ? WHERE id = ?", (wf_id, scene["id"])
+            "UPDATE clips SET workflow_id = ? WHERE id = ?", (wf_id, clip_id)
         )
         conn.commit()
     finally:
@@ -299,7 +319,7 @@ def test_enqueue_prompts_override(client, monkeypatch):
     queue_manager.paused = True
     try:
         jobs = asyncio_run(
-            enqueue_video_jobs(pid, scene_ids=[scene["id"]], prompts={scene["id"]: "CONFIRMED"})
+            enqueue_video_jobs(pid, scene_ids=[scene["id"]], prompts={clip_id: "CONFIRMED"})
         )
         raw = json.loads(jobs[0]["payload_json"])
         assert raw["prompt"] == "CONFIRMED"
@@ -311,6 +331,7 @@ def test_preview_prompt_prose_profile(client):
     """Prose workflows return the deterministic scene_video_prompt."""
     pid = _mk_project(client, "Preview prose")
     scene = _add_scene(client, pid, 1, action="A knight rides at dawn.")
+    clip_id = _scene_default_clip(pid, scene["id"])
 
     conn = get_db(settings.db_path)
     try:
@@ -329,7 +350,7 @@ def test_preview_prompt_prose_profile(client):
             ("Prose WF", json.dumps(wf)),
         )
         conn.execute(
-            "UPDATE scenes SET workflow_id = ? WHERE id = ?", (cur.lastrowid, scene["id"])
+            "UPDATE clips SET workflow_id = ? WHERE id = ?", (cur.lastrowid, clip_id)
         )
         conn.commit()
     finally:
@@ -337,7 +358,7 @@ def test_preview_prompt_prose_profile(client):
 
     r = client.post(
         f"/api/jobs/projects/{pid}/preview-prompt",
-        json={"scene_id": scene["id"]},
+        json={"clip_id": clip_id},
     )
     assert r.status_code == 200
     body = r.json()
@@ -349,7 +370,7 @@ def test_preview_prompt_missing_scene_400(client):
     pid = _mk_project(client, "Preview missing")
     r = client.post(
         f"/api/jobs/projects/{pid}/preview-prompt",
-        json={"scene_id": 99999},
+        json={"clip_id": 99999},
     )
     assert r.status_code == 400
 

@@ -3,7 +3,7 @@
  */
 
 export type WorkflowKind = 'image' | 'video';
-export type AttachmentKind = 'image' | 'video' | 'audio';
+export type AttachmentKind = 'image' | 'video' | 'audio' | 'document';
 
 export interface WorkflowMention {
 	type: 'workflow';

@@ -3,18 +3,24 @@
 	 * PromptPreviewModal — HITL review gate before Generate (issue #27).
 	 * Resolves the exact prompt (saved fresh draft → LLM rewrite → fallback),
 	 * lets the user edit/regenerate/save it, and only enqueues on confirm.
+	 * Clip-addressed when the project is expanded; falls back to scene
+	 * addressing (backend resolves the scene's default clip) otherwise.
 	 */
 	import { createMutation } from '@tanstack/svelte-query';
 	import { toast } from '$lib/toast';
-	import { jobsApi, projects, type Scene, type Workflow } from '$lib/api';
+	import { jobsApi, projects, type Clip, type Scene, type Workflow } from '$lib/api';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Icon from '$lib/components/ui/Icon.svelte';
 	import Modal from '$lib/components/ui/Modal.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
+	import { t } from '$lib/i18n.svelte';
 
 	interface Props {
 		open?: boolean;
 		projectId: number;
+		/** Clip addressing: the exact render unit to preview (backend contract). */
+		clip?: Clip | null;
+		/** Fallback when un-expanded (backend resolves clip #1 of the scene). */
 		scene: Scene | null;
 		workflow?: Workflow | null;
 		/** Extra form values to pass through on confirm. */
@@ -27,6 +33,7 @@
 	let {
 		open = $bindable(false),
 		projectId,
+		clip = null,
 		scene,
 		workflow = null,
 		inputValues = {},
@@ -38,16 +45,17 @@
 	let basedOn = $state('');
 	let fromDraft = $state(false);
 	let stale = $state(false);
-	/** Scene id whose resolve already fired once — guards against store-transition re-runs. */
+	/** Clip/scene key whose resolve already fired once — guards re-runs. */
 	let attemptedFor = $state<number | null>(null);
 	/** Resolve failed — modal shows a client-side prose fallback instead of a dead end. */
 	let failed = $state(false);
 
 	const preview = createMutation({
 		mutationFn: async () => {
-			if (!scene) throw new Error('No scene selected');
+			if (!clip && !scene) throw new Error(t('promptPreview.noClipSelected'));
 			return jobsApi.previewPrompt(projectId, {
-				scene_id: scene.id,
+				clip_id: clip?.id,
+				scene_id: clip ? undefined : scene?.id,
 				workflow_id: workflow?.id,
 			});
 		},
@@ -64,7 +72,7 @@
 				// Never a dead end: populate the editor with raw scene text so the
 				// user can edit and Generate (confirm sends it via prompts override),
 				// or hit Regenerate to retry the rewrite.
-				text = proseFallback(scene);
+				text = proseFallback(scene, clip);
 				basedOn = '';
 				fromDraft = false;
 			}
@@ -72,44 +80,66 @@
 		},
 	});
 
-	// Resolve once per scene. `attemptedFor` is set before mutating so
-	// mutation-store transitions (pending → success/error) can't re-trigger
-	// this effect — the old `text` guard fired duplicate requests while the
-	// first was still pending.
+	// Resolve once per clip (or scene for legacy rows). `attemptedFor` is set
+	// before mutating so mutation-store transitions (pending → success/error)
+	// can't re-trigger this effect — the old `text` guard fired duplicate
+	// requests while the first was still pending.
 	$effect(() => {
-		if (!open || !scene) return;
-		if (attemptedFor === scene.id) return;
-		attemptedFor = scene.id;
+		if (!open || (!clip && !scene)) return;
+		const key = clip?.id ?? -(scene?.id ?? 0);
+		if (attemptedFor === key) return;
+		attemptedFor = key;
 		$preview.mutate();
 	});
 
-	function proseFallback(s: Scene): string {
+	/** Fallback body when resolve fails: the clip's beat or the scene prose. */
+	function proseFallback(s: Scene, c: Clip | null): string {
+		if (c?.description) {
+			const heading = (s.heading || '').trim();
+			return [heading, c.description.trim()].filter(Boolean).join('\n\n');
+		}
 		const heading = (s.heading || '').trim();
 		const action = (s.action || '').trim();
 		const dialog = (s.dialog || '').trim();
 		return [heading, action, dialog].filter(Boolean).join('\n\n');
 	}
 
-	// Stale check: a draft saved against different scene content should warn.
+	// Stale check: a draft saved against different content should warn.
 	$effect(() => {
-		if (!scene || !basedOn) return;
-		const meta = scene.video_settings?.prompt_draft_meta?.based_on;
+		if (!clip || !basedOn) {
+			if (!clip) stale = false;
+			return;
+		}
+		const meta = clip.video_settings?.prompt_draft_meta?.based_on;
 		stale = fromDraft && meta != null && meta !== basedOn;
 	});
 
-	const draftMeta = $derived(scene?.video_settings?.prompt_draft_meta);
-
 	async function saveDraft() {
-		if (!scene || !text.trim()) return;
-		const existing = scene.video_settings ?? {};
+		if (!text.trim()) return;
+		const meta = { based_on: basedOn, saved_at: new Date().toISOString() };
+		if (clip) {
+			const next = {
+				...(clip.video_settings ?? {}),
+				prompt_draft: text,
+				prompt_draft_meta: meta,
+			};
+			try {
+				await projects.updateClip(projectId, clip.id, { video_settings: next });
+				toast.success(t('promptPreview.draftSaved'));
+			} catch (err) {
+				toast.error(err instanceof Error ? err.message : String(err));
+			}
+			return;
+		}
+		if (!scene) return;
 		const next = {
-			...existing,
+			...(scene.video_settings ?? {}),
 			prompt_draft: text,
-			prompt_draft_meta: { based_on: basedOn, saved_at: new Date().toISOString() },
+			prompt_draft_meta: meta,
 		};
 		try {
 			await projects.updateScene(projectId, scene.id, { video_settings: next });
-			toast.success('Draft saved — Generate will use it');
+			toast.success(t('promptPreview.draftSaved'));
 		} catch (err) {
 			toast.error(err instanceof Error ? err.message : String(err));
 		}
@@ -123,7 +153,7 @@
 	function confirmGenerate() {
 		const prompt = text.trim();
 		if (!prompt) {
-			toast.error('Prompt is empty — edit or regenerate before generating');
+			toast.error(t('promptPreview.promptEmpty'));
 			return;
 		}
 		open = false;
@@ -131,59 +161,70 @@
 	}
 </script>
 
-<Modal bind:open {onclose} title="Review prompt before generating" size="lg">
-	{#if !scene}
-		<p class="muted">No scene selected.</p>
+<Modal bind:open {onclose} title={t('promptPreview.title')} size="lg">
+	{#if !clip && !scene}
+		<p class="muted">{t('promptPreview.noClip')}</p>
 	{:else if $preview.isPending}
 		<div class="loading">
 			<Spinner size="md" />
-			<span>Resolving prompt{workflow?.prompt_profile === 'minimax_h3_ref' ? ' (H3 rewrite)' : ''}…</span>
+			<span>{t('promptPreview.resolving', { suffix: workflow?.prompt_profile === 'minimax_h3_ref' ? t('promptPreview.h3Rewrite') : '' })}</span>
 		</div>
 	{:else}
 		<div class="head-row">
-			<span class="meta">Scene #{scene.order_index} · {scene.heading || 'Untitled'}</span>
-			<span class="meta">{workflow?.name ?? 'Default workflow'}</span>
+			<span class="meta">
+				{#if clip}
+					{t('promptPreview.shotMeta', {
+						label: clip.label ?? `#${scene?.order_index ?? ''}`,
+						heading: scene?.heading || t('promptPreview.untitled'),
+					})}
+				{:else}
+					{t('promptPreview.sceneMeta', {
+						index: scene?.order_index ?? '',
+						heading: scene?.heading || t('promptPreview.untitled'),
+					})}
+				{/if}
+			</span>
+			<span class="meta">{workflow?.name ?? t('promptPreview.defaultWorkflow')}</span>
 		</div>
 
 		{#if stale}
 			<div class="stale-hint" role="status">
 				<Icon name="alert" size={14} />
-				<span>Saved draft is based on older scene content — regenerate to refresh it.</span>
+				<span>{t('promptPreview.staleHint')}</span>
 			</div>
 		{/if}
-
 		<textarea
 			class="prompt-editor"
 			bind:value={text}
 			rows={16}
 			spellcheck="false"
-			aria-label="Prompt text sent to the workflow"
+			aria-label={t('promptPreview.editorAria')}
 		></textarea>
 
 		{#if failed}
 			<div class="stale-hint" role="status">
 				<Icon name="alert" size={14} />
-				<span>Rewrite unavailable — showing raw scene text. You can edit and Generate, or Retry.</span>
+				<span>{t('promptPreview.failedHint')}</span>
 			</div>
 		{:else if fromDraft}
-			<p class="hint">Loaded from your saved draft. Regenerate re-runs the rewrite.</p>
+			<p class="hint">{t('promptPreview.fromDraftHint')}</p>
 		{:else if workflow?.prompt_profile === 'minimax_h3_ref'}
-			<p class="hint">MiniMax H3 six-section rewrite. Edit freely — this exact text goes to the (Input:prompt) node.</p>
+			<p class="hint">{t('promptPreview.h3Hint')}</p>
 		{:else}
-			<p class="hint">Scene prompt (prose profile). Edit freely before generating.</p>
+			<p class="hint">{t('promptPreview.proseHint')}</p>
 		{/if}
 	{/if}
 
 	{#snippet footer()}
-		<Button variant="ghost" onclick={() => (open = false)}>Cancel</Button>
+		<Button variant="ghost" onclick={() => (open = false)}>{t('common.cancelButton')}</Button>
 		<Button variant="secondary" disabled={$preview.isPending || !text} onclick={saveDraft}>
-			Save draft
+			{t('promptPreview.saveDraft')}
 		</Button>
 		<Button variant="secondary" disabled={$preview.isPending} onclick={regenerate}>
-			<Icon name="retry" size={14} /> Regenerate
+			<Icon name="retry" size={14} /> {t('promptPreview.regenerate')}
 		</Button>
 		<Button variant="primary" disabled={$preview.isPending || !text} onclick={confirmGenerate}>
-			<Icon name="play" size={14} /> Generate
+			<Icon name="play" size={14} /> {t('promptPreview.generate')}
 		</Button>
 	{/snippet}
 </Modal>

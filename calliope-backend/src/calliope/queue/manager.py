@@ -33,16 +33,17 @@ class QueueManager:
         kind: str,
         workflow_id: int | None = None,
         scene_id: int | None = None,
+        clip_id: int | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         conn = get_db(config.settings.db_path)
         try:
             cur = conn.execute(
                 """
-                INSERT INTO jobs (project_id, scene_id, kind, workflow_id, status, payload_json)
-                VALUES (?, ?, ?, ?, 'pending', ?)
+                INSERT INTO jobs (project_id, scene_id, clip_id, kind, workflow_id, status, payload_json)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
                 """,
-                (project_id, scene_id, kind, workflow_id, json.dumps(payload or {})),
+                (project_id, scene_id, clip_id, kind, workflow_id, json.dumps(payload or {})),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (cur.lastrowid,)).fetchone()

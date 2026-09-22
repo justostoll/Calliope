@@ -9,7 +9,8 @@
  *   - metadata (name, kind) for uploaded files
  */
 import { playgroundApi, type UploadKind } from '$lib/api';
-import { toast } from '$lib/toast';
+	import { toast } from '$lib/toast';
+	import { t } from '$lib/i18n.svelte';
 
 export interface UploadState {
 	/** nodeId → uploading filename (present while upload is in-flight) */
@@ -74,7 +75,7 @@ export function createUploadManager() {
 			try {
 				return await this.upload(nodeId, file);
 			} catch (err) {
-				toast.error(err instanceof Error ? err.message : 'Upload failed');
+				toast.error(err instanceof Error ? err.message : t('toast.uploadFailed'));
 				return null;
 			}
 		},
@@ -93,5 +94,6 @@ export function truncateMiddle(name: string, max = 32): string {
 export function acceptForKind(kind: string): string {
 	if (kind === 'audio') return 'audio/*';
 	if (kind === 'video') return 'video/*,.mp4,.webm,.mov,.mkv';
+	if (kind === 'document') return '.txt,.md,.docx';
 	return 'image/*';
 }

@@ -36,11 +36,13 @@ def test_tool_registry_schemas_valid():
         assert all(r in t.parameters["properties"] for r in required), name
 
 
-def test_openai_payload_scoping():
+def test_openai_payload_scoping(client):
     """Blind sessions see only requires_project=False tools.
 
     session_id is unused/high so a leftover local DB row cannot unlock
     requires_approval tools (those stay hidden until the user asks to render).
+    Needs the client fixture: visibility checks read the session log, which
+    requires a live temp DB (no leftover-settings flake).
     """
     blind = ToolContext(session_id=9_999_001, project_id=None)
     linked = ToolContext(session_id=9_999_001, project_id=99)

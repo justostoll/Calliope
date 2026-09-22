@@ -86,12 +86,18 @@ async def _request_beats_chunk(
     return beats
 
 
-async def _draft_story_chunked(
+async def _iter_story_chunks(
     project_id: int, project: dict[str, Any], required_beats: int
-) -> dict[str, Any]:
-    """Beat list in chunks of STORY_CHUNK (brief + first beats in call 1,
-    continuations after). Boards that fit one chunk behave exactly like the
-    old single call, including the corrective retry."""
+):
+    """Yield one chunk dict per LLM call as it completes.
+
+    The first yield carries the brief (title/logline/cast/locations/items +
+    first beats); continuation yields carry only their beats. The caller
+    persists + commits per yield, so a crash mid-draft keeps every chunk
+    already paid for instead of losing the whole story. Boards that fit one
+    chunk behave exactly like the old single call, including the corrective
+    retry.
+    """
     system = STORY_GENERATION_SYSTEM
     if required_beats <= STORY_CHUNK:
         messages = build_story_messages(
@@ -149,8 +155,15 @@ async def _draft_story_chunked(
             },
             )
             beats_out = result.get("beats") or []
-        result = {**result, "beats": beats_out}
-        return result
+        yield {
+            "title": result.get("title"),
+            "logline": result.get("logline"),
+            "characters": result.get("characters") or [],
+            "locations": result.get("locations") or [],
+            "items": result.get("items") or [],
+            "beats": beats_out,
+        }
+        return
 
     # 1) Brief + first chunk
     first_n = min(STORY_CHUNK, required_beats)
@@ -191,11 +204,21 @@ async def _draft_story_chunked(
         ]
     )
 
-    # 2) Continuation chunks
-    written = [dict(b) for b in beats_out[:first_n]]
-    for offset, b in enumerate(written):
+    # 2) Continuation chunks — each yields as soon as its LLM call lands, so
+    # the caller can commit the chunk durably before the next call starts.
+    first = [dict(b) for b in beats_out[:first_n]]
+    for offset, b in enumerate(first):
         b["order_index"] = offset + 1
-    start = len(written) + 1
+    yield {
+        "title": title,
+        "logline": logline,
+        "characters": brief.get("characters") or [],
+        "locations": brief.get("locations") or [],
+        "items": brief.get("items") or [],
+        "beats": first,
+    }
+    written_tail = list(first)
+    start = len(first) + 1
     total_calls = (required_beats + STORY_CHUNK - 1) // STORY_CHUNK
     call_no = 2
     while start <= required_beats:
@@ -216,7 +239,7 @@ async def _draft_story_chunked(
             total_beats=required_beats,
             chunk_start=start,
             chunk_beats=want,
-            previous_beats=written,
+            previous_beats=written_tail,
             cast_summary=cast_summary,
         )
         chunk = await _request_beats_chunk(system, user, want=want)
@@ -225,13 +248,19 @@ async def _draft_story_chunked(
         accepted = chunk[:want]
         for offset, b in enumerate(accepted):
             b["order_index"] = start + offset
-            written.append(b)
+        written_tail = list(written_tail) + accepted  # continuity: last 6 beats
         # Advance by what was actually accepted, so a short chunk never
         # leaves a hole in the 1..N order_index sequence.
         start += len(accepted)
         call_no += 1
-
-    return {**brief, "title": title, "logline": logline, "beats": written}
+        yield {
+            "title": None,
+            "logline": None,
+            "characters": [],
+            "locations": [],
+            "items": [],
+            "beats": accepted,
+        }
 
 
 @router.post("/{project_id}/generate-story")
@@ -252,115 +281,131 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
             },
         )
 
-        result = await _draft_story_chunked(project_id, project, required_beats)
-        beats_out = result.get("beats") or []
-        if len(beats_out) < required_beats:
+        # Durable chunked draft: each yielded chunk (brief first, then beat
+        # continuations) is inserted and committed BEFORE the next LLM call
+        # starts — a crash mid-draft keeps every chunk already written.
+        title: str | None = None
+        logline: str | None = None
+        written = 0
+        replace_started = False
+
+        async for chunk in _iter_story_chunks(project_id, project, required_beats):
+            if title is None:
+                title = chunk.get("title")
+                logline = chunk.get("logline")
+                conn.execute(
+                    "UPDATE projects SET title = ?, idea = COALESCE(?, idea), "
+                    "status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (title or project["title"], logline, project_id),
+                )
+            if replace and not replace_started:
+                # Clear the old board only once the first chunk is in hand —
+                # a failed first call leaves the old story intact.
+                conn.execute("DELETE FROM story_beats WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM characters WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM locations WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM items WHERE project_id = ?", (project_id,))
+                # scenes.location_id has no FK — the mass delete above would leave
+                # every scene pointing at a dead location row.
+                conn.execute(
+                    "UPDATE scenes SET location_id = NULL WHERE project_id = ?", (project_id,)
+                )
+                replace_started = True
+
+            for seed_kind, rows in (
+                ("characters", chunk.get("characters") or []),
+                ("locations", chunk.get("locations") or []),
+                ("items", chunk.get("items") or []),
+            ):
+                for entity in rows:
+                    if seed_kind == "characters":
+                        appearance = entity.get("appearance", "") or ""
+                        row_seed = {
+                            "name": entity.get("name", ""),
+                            "role": entity.get("role", ""),
+                            "age": entity.get("age", ""),
+                            "appearance": appearance,
+                            "personality": entity.get("personality", ""),
+                        }
+                        # Seed with the published sheet template so Assets shows a real prompt, not a hidden blob.
+                        conn.execute(
+                            """
+                            INSERT INTO characters
+                            (project_id, name, role, age, appearance, personality, consistency_prompt)
+                            VALUES (:project_id, :name, :role, :age, :appearance, :personality, :consistency_prompt)
+                            """,
+                            {
+                                "project_id": project_id,
+                                **row_seed,
+                                "consistency_prompt": character_sheet_prompt(row_seed),
+                            },
+                        )
+                    elif seed_kind == "locations":
+                        description = entity.get("description", "") or ""
+                        loc_seed = {"name": entity.get("name", ""), "description": description}
+                        conn.execute(
+                            """
+                            INSERT INTO locations (project_id, name, description, consistency_prompt)
+                            VALUES (:project_id, :name, :description, :consistency_prompt)
+                            """,
+                            {
+                                "project_id": project_id,
+                                **loc_seed,
+                                "consistency_prompt": location_reference_prompt(loc_seed),
+                            },
+                        )
+                    else:
+                        description = entity.get("description", "") or ""
+                        item_seed = {"name": entity.get("name", ""), "description": description}
+                        conn.execute(
+                            """
+                            INSERT INTO items (project_id, name, description, consistency_prompt)
+                            VALUES (:project_id, :name, :description, :consistency_prompt)
+                            """,
+                            {
+                                "project_id": project_id,
+                                **item_seed,
+                                "consistency_prompt": item_reference_prompt(item_seed),
+                            },
+                        )
+
+            for beat in chunk.get("beats") or []:
+                conn.execute(
+                    """
+                    INSERT INTO story_beats (project_id, order_index, title, description)
+                    VALUES (:project_id, :order_index, :title, :description)
+                    """,
+                    {
+                        "project_id": project_id,
+                        "order_index": beat.get("order_index", 0),
+                        "title": beat.get("title", ""),
+                        "description": beat.get("description", ""),
+                    },
+                )
+                written += 1
+
+            # Commit per chunk — the whole point of the generator split.
+            conn.commit()
+            if chunk.get("beats"):
+                await event_bus.publish(
+                    "agent.thinking",
+                    {
+                        "project_id": project_id,
+                        "message": f"Saved {written}/{required_beats} beats…",
+                    },
+                )
+
+        if written < required_beats:
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    f"Story draft returned {len(beats_out)} beats but target "
+                    f"Story draft returned {written} beats but target "
                     f"'{project.get('target_duration')}' requires {required_beats}. "
                     "Try Draft Storyline again, or check the LLM follows JSON instructions."
                 ),
             )
 
-        title = result.get("title") or project["title"]
-        logline = result.get("logline")
-        conn.execute(
-            "UPDATE projects SET title = ?, idea = COALESCE(?, idea), status = 'in_progress', "
-            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (title, logline, project_id),
-        )
-
-        if replace:
-            conn.execute("DELETE FROM story_beats WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM characters WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM locations WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM items WHERE project_id = ?", (project_id,))
-            # scenes.location_id has no FK — the mass delete above would leave
-            # every scene pointing at a dead location row.
-            conn.execute(
-                "UPDATE scenes SET location_id = NULL WHERE project_id = ?", (project_id,)
-            )
-
-        for beat in result.get("beats", []):
-            conn.execute(
-                """
-                INSERT INTO story_beats (project_id, order_index, title, description)
-                VALUES (:project_id, :order_index, :title, :description)
-                """,
-                {
-                    "project_id": project_id,
-                    "order_index": beat.get("order_index", 0),
-                    "title": beat.get("title", ""),
-                    "description": beat.get("description", ""),
-                },
-            )
-
-        for character in result.get("characters", []):
-            appearance = character.get("appearance", "") or ""
-            row_seed = {
-                "name": character.get("name", ""),
-                "role": character.get("role", ""),
-                "age": character.get("age", ""),
-                "appearance": appearance,
-                "personality": character.get("personality", ""),
-            }
-            # Seed with the published sheet template so Assets shows a real prompt, not a hidden blob.
-            sheet_prompt = character_sheet_prompt(row_seed)
-            conn.execute(
-                """
-                INSERT INTO characters
-                (project_id, name, role, age, appearance, personality, consistency_prompt)
-                VALUES (:project_id, :name, :role, :age, :appearance, :personality, :consistency_prompt)
-                """,
-                {
-                    "project_id": project_id,
-                    **row_seed,
-                    "consistency_prompt": sheet_prompt,
-                },
-            )
-
-        for location in result.get("locations", []):
-            description = location.get("description", "") or ""
-            loc_seed = {
-                "name": location.get("name", ""),
-                "description": description,
-            }
-            env_prompt = location_reference_prompt(loc_seed)
-            conn.execute(
-                """
-                INSERT INTO locations (project_id, name, description, consistency_prompt)
-                VALUES (:project_id, :name, :description, :consistency_prompt)
-                """,
-                {
-                    "project_id": project_id,
-                    **loc_seed,
-                    "consistency_prompt": env_prompt,
-                },
-            )
-
-        for item in result.get("items", []):
-            description = item.get("description", "") or ""
-            item_seed = {
-                "name": item.get("name", ""),
-                "description": description,
-            }
-            item_prompt = item_reference_prompt(item_seed)
-            conn.execute(
-                """
-                INSERT INTO items (project_id, name, description, consistency_prompt)
-                VALUES (:project_id, :name, :description, :consistency_prompt)
-                """,
-                {
-                    "project_id": project_id,
-                    **item_seed,
-                    "consistency_prompt": item_prompt,
-                },
-            )
-
-        conn.commit()
-        beat_n = len(result.get("beats", []))
+        beat_n = written
         await event_bus.publish(
             "story.ready",
             {
@@ -368,7 +413,7 @@ async def generate_story(project_id: int, replace: bool = True) -> dict[str, Any
                 "message": f"Story drafted — {beat_n} beats",
             },
         )
-        return {"ok": True, "project_id": project_id, "generated": result}
+        return {"ok": True, "project_id": project_id, "generated": {"beats": beat_n}}
     except HTTPException:
         raise
     except Exception as exc:

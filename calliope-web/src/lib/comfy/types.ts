@@ -41,6 +41,8 @@ export interface Job {
 	id: number;
 	project_id: number;
 	scene_id: number | null;
+	/** Render unit — video jobs are clip jobs (scene_id stays for grouping). */
+	clip_id: number | null;
 	kind: string;
 	workflow_id: number | null;
 	status: string;
@@ -85,4 +87,23 @@ export interface Scene {
 		portrait_path: string | null;
 		sheet_path: string | null;
 	}>;
+	clips: Clip[];
+}
+
+/** Shot unit: one scene expands into 1+ clips; each renders one ~5-10s video. */
+export interface Clip {
+	id: number;
+	scene_id: number;
+	project_id: number;
+	order_index: number;
+	description: string | null;
+	shot_size: string | null;
+	dialog_lines_covered: number[] | null;
+	duration_sec: number | null;
+	workflow_id: number | null;
+	clip_path: string | null;
+	chain_from_prev?: number | boolean | null;
+	video_settings?: SceneVideoSettings | null;
+	/** '#3.2' — scene 3, clip 2 (display label). */
+	label?: string;
 }

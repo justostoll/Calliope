@@ -155,7 +155,10 @@ def test_continue_scene_defers_to_worker_without_clip(client):
     jobs = asyncio.run(enqueue_video_jobs(pid))
     payloads = _job_payloads(pid)
     assert len(payloads) == 2
-    assert payloads[1]["continue_source"] == {"scene_order_index": 2}
+    assert payloads[1]["continue_source"] == {
+        "scene_order_index": 2,
+        "clip_order_index": 1,
+    }
     assert "20" not in payloads[1]["input_values"]
     assert jobs[1]["scene_id"] == scene2["id"]
 
@@ -319,7 +322,10 @@ def test_worker_resolves_continue_source_into_video_node(client, monkeypatch):
     jobs = asyncio.run(enqueue_video_jobs(pid))
     assert len(jobs) == 2
     payloads = _job_payloads(pid)
-    assert payloads[1].get("continue_source") == {"scene_order_index": 2}
+    assert payloads[1].get("continue_source") == {
+        "scene_order_index": 2,
+        "clip_order_index": 1,
+    }
 
     job = _last_job_row(pid)
     assert job["workflow_id"] == wid
@@ -369,10 +375,13 @@ def test_worker_fails_continue_job_without_previous_clip(client, monkeypatch):
 
     asyncio.run(enqueue_video_jobs(pid))
     payloads = _job_payloads(pid)
-    assert payloads[1].get("continue_source") == {"scene_order_index": 2}
+    assert payloads[1].get("continue_source") == {
+        "scene_order_index": 2,
+        "clip_order_index": 1,
+    }
     job = _last_job_row(pid)
 
-    # Run only the continue job: its earlier scene has no clip on disk yet,
+    # Run only the continue job: its earlier clip has no video on disk yet,
     # so the worker must fail it with a clear message (the loop records it
     # via mark_failed + job.failed event).
     captured: dict = {}
@@ -380,8 +389,8 @@ def test_worker_fails_continue_job_without_previous_clip(client, monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         asyncio.run(queue_worker._run_job(job))
     message = str(excinfo.value)
-    assert "Continue scene 2" in message
-    assert "previous clip (scene 1) has no video file" in message
+    assert "Continue clip 2.1" in message
+    assert "previous clip (scene 1.1) has no video file" in message
     assert "generate the earlier clip first" in message
     # Nothing reached ComfyUI.
     assert captured == {}

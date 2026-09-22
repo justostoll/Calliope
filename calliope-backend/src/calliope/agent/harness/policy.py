@@ -1,16 +1,20 @@
-"""HITL / confirmation policy — mechanical gates only.
+"""Permission policy — the user's command IS the permission.
 
-Design rule (learned the hard way on canvas/62 + canvas/65): policy decides
-PERMISSION from explicit user acts; it never guesses SCOPE from prose.
-Scope is enforced mechanically by the enqueue tools (explicit ids, or an
-explicit all_missing=true / "all scenes" word). Prose heuristics here are
-limited to: does this message ask for generation at all, or confirm an
-offer — nothing more.
+A local tool for local users. When someone types "Regenerate the full
+script for this project — turn the story into scenes", that is an ORDER,
+not a suggestion to negotiate. The policy's jobs:
 
-Permission sources (any one grants):
-- an ask_user card answered affirmatively with scope=render (structured),
-- an @workflow tag (a deliberate picker act),
-- render verbs in the user's own words, or a terse confirmation.
+1. read INTENT from the user's own words (generation ask, confirmation);
+2. keep structured approvals (ask_user cards) working;
+3. leave SCOPE to the tools' arguments (ids, all_missing, refs) — prose
+   never decides scope.
+
+There is deliberately no message-length cap ("regenerate the full script
+for this project, keep the characters and locations consistent" is one
+command, not a suspicious wall of text), no global-negation veto ("don't
+overthink, render all scenes" is a command), and no politeness filter.
+Negation is CLAUSE-scoped: only a "no" inside ~4 words of the cue vetoes
+that cue.
 """
 from __future__ import annotations
 
@@ -19,12 +23,14 @@ from typing import Any
 
 from calliope.agent.harness.registry import ToolContext
 
-# Affirmation cues for an explicit user "yes" (or "replace it" / "start over").
+# Affirmation cues: an explicit yes OR a regeneration verb — "regenerate
+# the script" both asks and authorizes in one message.
 _CONFIRM_RE = re.compile(
     r"\b(yes|yeah|yep|yup|sure|ok|okay|k|confirm(?:ed)?|proceed|"
     r"go\s+ahead|do\s+it|please\s+do|overwrite|replace|append|regenerate|"
     r"redo|re-?do|start\s+over|restart|delete|wipe|reset|from\s+scratch|"
-    r"go\s+for\s+it|fine|sounds\s+good|that'?s\s+fine)\b",
+    r"regen\b|rebuild|rewrite|re-?write|go\s+for\s+it|fine|sounds\s+good|"
+    r"that'?s\s+fine)\b",
     re.IGNORECASE,
 )
 _NEGATE_RE = re.compile(
@@ -35,8 +41,13 @@ _NEGATE_RE = re.compile(
 # Image/video *generation* intent. `video` matches as a SUBSTRING so model /
 # compound names keep signaling intent ("text2video", "fastvideoH3_t2v-API");
 # everything else is \b-anchored (`vid` must not match "provide").
+# clip/shot/storyboard are RENDER-UNIT nouns in Calliope's vocabulary (clips
+# are the render units) — "break the beats into the script + shot clips" is a
+# generation order, not a text edit (session 908: the video sub-agent's tools
+# stayed hidden and it reported "the generation tool is not exposed").
 _RENDER_REQUEST_RE = re.compile(
-    r"(video|\b(?:render|image|portrait|sheet|artwork|visual|thumbnail|vid)\w*|"
+    r"(video|\b(?:render|image|portrait|sheet|artwork|visual|thumbnail|vid|"
+    r"clip|shot|storyboard)\w*|"
     r"txt2\w+|text2\w+|img2\w+|photo2\w+)",
     re.IGNORECASE,
 )
@@ -56,25 +67,44 @@ def user_prose(text: str) -> str:
     return raw.strip()
 
 
+def _cue_is_negated(before: str, after: str) -> bool:
+    """Only a short negation directly adjacent to the cue vetoes it."""
+    before_words = before.split()
+    if before_words and _NEGATE_RE.search(" ".join(before_words[-4:])):
+        return True
+    if re.match(r"\s*(no|not|don'?t|never)\b", after, re.IGNORECASE):
+        return True
+    return False
+
+
 def is_confirmation(text: str) -> bool:
-    """A terse, non-negated message carrying an explicit affirmative cue."""
+    """True when any clause of the message commands/confirms an action.
+
+    Clause-scoped negation: "don't change the story, regenerate the script"
+    confirms (the veto sits in a different clause than the cue); "no, don't
+    replace" does not.
+    """
     t = user_prose(text)
-    if not t or len(t) > 200:
+    if not t:
         return False
-    if _NEGATE_RE.search(t):
-        return False
-    return bool(_CONFIRM_RE.search(t))
+    for clause in re.split(r"[,.;!?]|\bbut\b|\bhowever\b", t, flags=re.IGNORECASE):
+        m = _CONFIRM_RE.search(clause)
+        if not m:
+            continue
+        before = clause[: m.start()]
+        after = clause[m.end() :]
+        if not _cue_is_negated(before, after):
+            return True
+    return False
 
 
 def is_render_request(text: str) -> bool:
     """True when the message explicitly asks for image/video generation.
 
-    Negation is CLAUSE-scoped, not message-global: "no image need, all 20
-    scenes use this text2video workflow" is a render request with a negated
-    clause about images. A global veto made "do not overthink, make the
-    video" read as a refusal and hid the render tools (the agent then
-    fabricated job ids — the bug this keeps fixed). Only a negation in the
-    SAME clause as the render cue counts against it.
+    Clause-scoped negation: "no image need, all 20 scenes use this
+    text2video workflow" is a render request. A global veto made "do not
+    overthink, make the video" read as a refusal and hid the render tools
+    (canvas/62). Only a negation adjacent to the cue counts against it.
     """
     t = user_prose(text)
     if not t:
@@ -86,11 +116,8 @@ def is_render_request(text: str) -> bool:
         for match in _RENDER_REQUEST_RE.finditer(clause):
             before = clause[max(0, match.start() - 60) : match.start()]
             after = clause[match.end() : match.end() + 30]
-            if _NEGATE_RE.search(before) and len(before.split()) <= 4:
-                continue
-            if re.match(r"\s*(no|not|don'?t|never)\b", after, re.IGNORECASE):
-                continue
-            return True
+            if not _cue_is_negated(before, after):
+                return True
     return False
 
 

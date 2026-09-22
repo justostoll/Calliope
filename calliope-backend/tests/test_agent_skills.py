@@ -29,6 +29,8 @@ def test_builtin_skills_seeded(client):
     assert (root / "h3-video-prompt-enhancer" / "references" / "ref2va-format.md").is_file()
     assert (root / "scene-to-video" / "SKILL.md").is_file()
     assert (root / "character-consistency" / "SKILL.md").is_file()
+    assert (root / "shot-composer-blockout" / "SKILL.md").is_file()
+    assert (root / "shot-composer-blockout" / "references" / "motion-recipes.md").is_file()
 
 
 def test_seeding_never_overwrites_user_edits(client):

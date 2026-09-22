@@ -66,6 +66,8 @@ export function connectEvents(
 			'asset.ready',
 			'story.ready',
 			'canvas.updated',
+			'shot.updated',
+			'shot.capture.saved',
 		].forEach((name) => es!.addEventListener(name, handler as EventListener));
 		es.onmessage = handler;
 		es.onerror = () => {

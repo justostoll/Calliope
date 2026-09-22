@@ -1,6 +1,8 @@
 [project]
 name = "calliope"
-version = "1.4.1"
+# Single-sourced from src/calliope/__init__.py (__version__) — PR #47: the
+# static literal here drifted from main.py twice.
+dynamic = ["version"]
 description = "Local-first AI story-to-video studio"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +15,7 @@ dependencies = [
     "python-multipart>=0.0.12",
     "comfy-mcp>=0.10.0",
     "mcp>=2.0.0",
+    "pillow>=12.3.0",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +27,9 @@ calliope = "calliope.main:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/calliope/__init__.py"
 
 [tool.ruff]
 line-length = 100

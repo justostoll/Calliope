@@ -73,7 +73,10 @@ def _extract_prompt_profiles() -> list[str]:
 
 
 def _extract_guard_codes() -> list[str]:
+    # Guard codes are DEFINED in registry.py (avoids the circular import) and
+    # re-exported through harness/__init__.py — scan both.
     text = (SRC / "agent" / "harness" / "__init__.py").read_text(encoding="utf-8")
+    text += "\n" + (SRC / "agent" / "harness" / "registry.py").read_text(encoding="utf-8")
     return sorted(set(re.findall(r'GUARD_[A-Z_]+ = "([a-z_]+)"', text)))
 
 

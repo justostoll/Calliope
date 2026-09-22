@@ -43,6 +43,28 @@ def test_health(client):
     assert r.json()["status"] == "ok"
 
 
+def test_health_version_matches_package_metadata(client):
+    """PR #47: the served version must come from package metadata
+    (single-sourced via calliope.__version__), never a stale hard-coded
+    literal — 1.3.2 shipped reporting 1.2.1, 1.4.1 reported 1.4.0."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    # dynamic = ["version"] means pyproject no longer carries the literal;
+    # the truth lives in src/calliope/__init__.py.
+    from calliope import __version__
+
+    assert data["project"].get("version") is None, (
+        "pyproject pins a literal version — single-source it via "
+        "calliope.__version__ (PR #47)"
+    )
+
+    r = client.get("/api/health")
+    assert r.json()["version"] == __version__
+
+
 def test_create_and_list_project(client):
     r = client.post("/api/projects", json={"title": "Test", "idea": "idea"})
     assert r.status_code == 200
@@ -110,6 +132,22 @@ def test_update_project_cover(client):
     r = client.patch(f"/api/projects/{pid}", json={"title": "Cover 2"})
     assert r.json()["title"] == "Cover 2"
     assert r.json()["cover_path"] is None
+
+
+def test_create_project_accepts_name_alias(client):
+    """LLM agents and external API clients often emit `name` for the required
+    title field — the schema aliases it instead of returning an opaque 422."""
+    r = client.post("/api/projects", json={"name": "Aliased", "idea": "idea"})
+    assert r.status_code == 200
+    assert r.json()["title"] == "Aliased"
+
+
+def test_update_project_accepts_name_alias(client):
+    r = client.post("/api/projects", json={"title": "Old"})
+    pid = r.json()["id"]
+    r = client.patch(f"/api/projects/{pid}", json={"name": "Renamed"})
+    assert r.status_code == 200
+    assert r.json()["title"] == "Renamed"
 
 
 def test_delete_project(client):

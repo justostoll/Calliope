@@ -215,47 +215,54 @@ class QueueWorker:
         workflow: dict[str, Any],
         input_values: dict[str, Any],
     ) -> dict[str, Any]:
-        """Fill the workflow's video input with the previous scene's clip.
+        """Fill the workflow's video input with the previous clip's file.
 
-        Enqueue defers continue-scenes whose earlier clip does not exist yet
+        Enqueue defers continue-clips whose earlier clip does not exist yet
         (batch generation); the queue is concurrency-1, so by the time this job
-        runs the earlier clip has been rendered and attached to its scene. The
-        path is injected into ``input_values`` like any user-provided value —
-        ``patch_workflow`` writes it onto the ``(Input:video)`` node and
+        runs the earlier clip has been rendered and attached to its clip row.
+        The path is injected into ``input_values`` like any user-provided value
+        — ``patch_workflow`` writes it onto the ``(Input:video)`` node and
         ``prepare_media_inputs`` uploads it to ComfyUI before queuing.
         """
         project_id = job["project_id"]
-        order_index = (payload.get("continue_source") or {}).get("scene_order_index")
-        if order_index is None:
-            order_index = payload.get("scene_order_index") or 0
+        src = payload.get("continue_source") or {}
+        scene_pos = src.get("scene_order_index")
+        clip_pos = src.get("clip_order_index")
+        if scene_pos is None:
+            scene_pos = payload.get("scene_order_index") or 0
+        if clip_pos is None:
+            clip_pos = 1
 
-        prev_order: int | None = None
+        prev: tuple[int, int] | None = None  # (scene_pos, clip_pos) of the donor
         prev_clip: str | None = None
         conn = get_db(config.settings.db_path)
         try:
             row = conn.execute(
                 """
-                SELECT order_index, video_path FROM scenes
-                WHERE project_id = ? AND order_index < ?
-                ORDER BY order_index DESC LIMIT 1
+                SELECT s.order_index AS s_pos, c.order_index AS c_pos,
+                       COALESCE(c.clip_path, s.video_path) AS clip_path
+                FROM clips c JOIN scenes s ON s.id = c.scene_id
+                WHERE c.project_id = ?
+                  AND (s.order_index < ? OR (s.order_index = ? AND c.order_index < ?))
+                ORDER BY s.order_index DESC, c.order_index DESC LIMIT 1
                 """,
-                (project_id, order_index),
+                (project_id, scene_pos, scene_pos, clip_pos),
             ).fetchone()
             if row:
-                prev_order = row["order_index"]
-                prev_clip = row["video_path"]
+                prev = (row["s_pos"], row["c_pos"])
+                prev_clip = row["clip_path"]
         finally:
             conn.close()
 
-        scene_n = order_index
-        if prev_order is None:
+        pos_label = f"{scene_pos}.{clip_pos}"
+        if prev is None:
             raise RuntimeError(
-                f"Continue scene {scene_n}: no earlier scene in this project to continue from."
+                f"Continue clip {pos_label}: no earlier clip in this project to continue from."
             )
         if not prev_clip or not _fs_path(prev_clip).exists():
             raise RuntimeError(
-                f"Continue scene {scene_n}: previous clip (scene {prev_order}) has no video file "
-                "— generate the earlier clip first."
+                f"Continue clip {pos_label}: previous clip (scene {prev[0]}.{prev[1]}) has no "
+                "video file — generate the earlier clip first."
             )
 
         video_node: str | None = None
@@ -265,8 +272,8 @@ class QueueWorker:
                 break
         if video_node is None:
             raise RuntimeError(
-                "Continue scene "
-                f"{scene_n}: workflow has no (Input:video) node to receive the previous clip."
+                "Continue clip "
+                f"{pos_label}: workflow has no (Input:video) node to receive the previous clip."
             )
 
         input_values[video_node] = prev_clip
@@ -275,7 +282,7 @@ class QueueWorker:
             {
                 "job_id": job["id"],
                 "project_id": project_id,
-                "message": f"Continuing from scene {prev_order} clip",
+                "message": f"Continuing from clip {prev[0]}.{prev[1]}",
             },
         )
         return input_values
@@ -380,6 +387,19 @@ class QueueWorker:
                 ).fetchone()
                 name = row["name"] if row else f"#{payload['item_id']}"
                 return f"{name} · item"
+            if job.get("clip_id"):
+                row = conn.execute(
+                    """
+                    SELECT s.heading, s.order_index AS s_pos, c.order_index AS c_pos
+                    FROM clips c JOIN scenes s ON s.id = c.scene_id
+                    WHERE c.id = ?
+                    """,
+                    (job["clip_id"],),
+                ).fetchone()
+                if row:
+                    heading = (row["heading"] or f"Scene {row['s_pos']}").strip()
+                    return f"#{row['s_pos']}.{row['c_pos']} · {heading}"
+                return f"Clip #{job['clip_id']}"
             if job.get("scene_id"):
                 row = conn.execute(
                     "SELECT heading, order_index FROM scenes WHERE id = ?", (job["scene_id"],)
@@ -427,7 +447,32 @@ class QueueWorker:
                     "UPDATE items SET reference_image_path = ? WHERE id = ?",
                     (primary, item_id),
                 )
-            if scene_id and job["kind"] == "video":
+            if job.get("clip_id") and job["kind"] == "video":
+                conn.execute(
+                    "UPDATE clips SET clip_path = ? WHERE id = ?",
+                    (primary, job["clip_id"]),
+                )
+                # Mirror onto the scene for legacy readers (canvas scene cards,
+                # old queries). The clip row stays the source of truth.
+                conn.execute(
+                    """
+                    UPDATE scenes SET video_path = ? WHERE id = (
+                        SELECT scene_id FROM clips WHERE id = ?
+                    )
+                    """,
+                    (primary, job["clip_id"]),
+                )
+            elif scene_id and job["kind"] == "video":
+                # Legacy job (pre-clips schema): write the scene's default clip.
+                conn.execute(
+                    """
+                    UPDATE clips SET clip_path = ? WHERE id = (
+                        SELECT c.id FROM clips c WHERE c.scene_id = ?
+                        ORDER BY c.order_index, c.id LIMIT 1
+                    )
+                    """,
+                    (primary, scene_id),
+                )
                 conn.execute(
                     "UPDATE scenes SET video_path = ? WHERE id = ?",
                     (primary, scene_id),

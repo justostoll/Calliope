@@ -1,4 +1,4 @@
-"""Enqueue per-scene video generation jobs."""
+"""Enqueue per-clip video generation jobs (a scene expands into many clips)."""
 from __future__ import annotations
 
 import hashlib
@@ -103,29 +103,83 @@ def _video_input(inputs: list[dict[str, Any]]) -> dict[str, Any] | None:
 def _previous_clip(
     conn: sqlite3.Connection,
     project_id: int,
-    order_index: int,
+    global_position: tuple[int, int],
 ) -> tuple[str | None, bool]:
-    """Nearest earlier scene's clip path + whether any earlier scene exists.
+    """Nearest earlier clip (global playback order) + whether any earlier clip exists.
 
-    Returns ``(path, has_earlier_scene)``; path is None when the clip file does
-    not exist on disk (not yet generated) or there is no earlier scene.
+    ``global_position`` is the current clip's ``(scene.order_index, clip.order_index)``.
+    Returns ``(path, has_earlier)``; path is None when the file does not exist on
+    disk (not yet generated) or there is no earlier clip.
     """
+    scene_pos, clip_pos = global_position
     row = conn.execute(
         """
-        SELECT video_path FROM scenes
-        WHERE project_id = ? AND order_index < ? AND video_path IS NOT NULL
-        ORDER BY order_index DESC LIMIT 1
+        SELECT COALESCE(c.clip_path, s.video_path) AS clip_path FROM clips c
+        JOIN scenes s ON s.id = c.scene_id
+        WHERE c.project_id = ?
+          AND (s.order_index < ? OR (s.order_index = ? AND c.order_index < ?))
+          AND COALESCE(c.clip_path, s.video_path) IS NOT NULL
+        ORDER BY s.order_index DESC, c.order_index DESC LIMIT 1
         """,
-        (project_id, order_index),
+        (project_id, scene_pos, scene_pos, clip_pos),
     ).fetchone()
     has_earlier = conn.execute(
-        "SELECT 1 FROM scenes WHERE project_id = ? AND order_index < ? LIMIT 1",
-        (project_id, order_index),
+        """
+        SELECT 1 FROM clips c JOIN scenes s ON s.id = c.scene_id
+        WHERE c.project_id = ?
+          AND (s.order_index < ? OR (s.order_index = ? AND c.order_index < ?))
+        LIMIT 1
+        """,
+        (project_id, scene_pos, scene_pos, clip_pos),
     ).fetchone() is not None
-    path = row["video_path"] if row else None
+    path = row["clip_path"] if row else None
     if path and Path(path).exists():
         return path, has_earlier
     return None, has_earlier
+
+
+def _fetch_clips(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    scene_ids: list[int] | None = None,
+    clip_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Clips joined with their scenes, in global playback order.
+
+    Clip columns COALESCE onto the scene's legacy columns (video_path, chain)
+    so pre-clips rows and legacy scene-level writes keep working unchanged.
+    """
+    query = """
+        SELECT c.*,
+               COALESCE(c.clip_path, s.video_path) AS resolved_clip_path,
+               CASE WHEN COALESCE(c.chain_from_prev, 0) = 0 AND c.order_index = 1
+                    THEN COALESCE(s.chain_from_prev, 0)
+                    ELSE COALESCE(c.chain_from_prev, 0) END AS chain_flag,
+               s.heading, s.action, s.dialog, s.order_index AS scene_order_index,
+               s.duration_sec AS scene_duration_sec, s.env_image_path, s.location_id
+        FROM clips c JOIN scenes s ON s.id = c.scene_id
+        WHERE c.project_id = ?
+    """
+    params: list[Any] = [project_id]
+    if clip_ids:
+        placeholders = ",".join("?" * len(clip_ids))
+        query += f" AND c.id IN ({placeholders})"
+        params.extend(clip_ids)
+    elif scene_ids:
+        placeholders = ",".join("?" * len(scene_ids))
+        query += f" AND c.scene_id IN ({placeholders})"
+        params.extend(scene_ids)
+    query += " ORDER BY s.order_index, c.order_index, c.id"
+    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    for r in rows:
+        # Legacy fallbacks: resolved names win over the raw clip columns.
+        r["clip_path"] = r.get("resolved_clip_path") or r.get("clip_path")
+        if r.get("chain_flag"):
+            r["chain_from_prev"] = r["chain_flag"]
+        r.pop("resolved_clip_path", None)
+        r.pop("chain_flag", None)
+    return rows
 
 
 def _workflow_json(workflow: dict[str, Any] | None) -> dict[str, Any]:
@@ -157,9 +211,9 @@ def _get_workflow(workflow_id: int | None = None) -> dict[str, Any] | None:
         conn.close()
 
 
-def _scene_video_settings(scene: dict[str, Any]) -> dict[str, Any]:
-    """Parsed scenes.video_settings_json — {} when unset or malformed."""
-    raw = scene.get("video_settings_json")
+def _clip_video_settings(clip: dict[str, Any]) -> dict[str, Any]:
+    """Parsed clips.video_settings_json — {} when unset or malformed."""
+    raw = clip.get("video_settings_json")
     if not raw:
         return {}
     try:
@@ -169,32 +223,44 @@ def _scene_video_settings(scene: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _stored_input_values(scene: dict[str, Any]) -> dict[str, Any]:
-    """Saved per-scene form values (input_values inside video_settings)."""
-    values = _scene_video_settings(scene).get("input_values")
+def _stored_input_values(clip: dict[str, Any]) -> dict[str, Any]:
+    """Saved per-clip form values (input_values inside video_settings)."""
+    values = _clip_video_settings(clip).get("input_values")
     if isinstance(values, dict):
         return {k: v for k, v in values.items() if v not in (None, "")}
     return {}
 
 
-def _stored_prompt_draft(scene: dict[str, Any]) -> str | None:
-    draft = _scene_video_settings(scene).get("prompt_draft")
+def _stored_prompt_draft(clip: dict[str, Any]) -> str | None:
+    draft = _clip_video_settings(clip).get("prompt_draft")
     return draft if isinstance(draft, str) and draft.strip() else None
 
 
-def _scene_prompt_hash(scene: dict[str, Any]) -> str:
-    """Cheap fingerprint of the inputs a draft was based on (stale detection)."""
+def _clip_prompt_hash(clip: dict[str, Any]) -> str:
+    """Cheap fingerprint of the inputs a draft was based on (stale detection).
+
+    Combines the scene's content fingerprint with the clip's own fields, so an
+    edit to either invalidates saved drafts. Keeps the scene-only fields in the
+    basis (heading/action/dialog/location/characters) so legacy drafts saved
+    against scene-level hashes invalidate consistently.
+    """
     basis = "|".join(
-        str(scene.get(k) or "")
+        str(clip.get(k) or "")
         for k in ("heading", "action", "dialog", "duration_sec", "location_id")
     )
-    chars = ",".join(str(c) for c in sorted(scene.get("character_ids") or []))
-    return hashlib.sha256((basis + "|" + chars).encode()).hexdigest()[:16]
+    chars = ",".join(str(c) for c in sorted(clip.get("character_ids") or []))
+    clip_basis = "|".join(
+        str(clip.get(k) or "")
+        for k in ("description", "shot_size", "duration_sec", "order_index")
+    )
+    return hashlib.sha256(
+        (basis + "|" + chars + "|clip:" + clip_basis).encode()
+    ).hexdigest()[:16]
 
 
-async def preview_scene_prompt(
+async def preview_clip_prompt(
     project_id: int,
-    scene_id: int,
+    clip_id: int,
     workflow_id: int | None = None,
 ) -> dict[str, Any]:
     """Resolve the exact prompt a Generate would send — without enqueueing.
@@ -205,12 +271,18 @@ async def preview_scene_prompt(
     conn = get_db(settings.db_path)
     try:
         row = conn.execute(
-            "SELECT * FROM scenes WHERE id = ? AND project_id = ?",
-            (scene_id, project_id),
+            """
+            SELECT c.*, s.heading, s.action, s.dialog, s.order_index AS scene_order_index,
+                   s.env_image_path, s.location_id
+            FROM clips c JOIN scenes s ON s.id = c.scene_id
+            WHERE c.id = ? AND c.project_id = ?
+            """,
+            (clip_id, project_id),
         ).fetchone()
         if not row:
-            raise ValueError(f"Scene {scene_id} not found in project {project_id}")
-        scene = row_to_dict(row)
+            raise ValueError(f"Clip {clip_id} not found in project {project_id}")
+        clip = dict(row)
+        scene_id = clip["scene_id"]
         char_rows = conn.execute(
             """
             SELECT c.* FROM characters c
@@ -220,13 +292,13 @@ async def preview_scene_prompt(
             (scene_id,),
         ).fetchall()
         characters = [row_to_dict(r) for r in char_rows]
-        loc_image = scene.get("env_image_path")
+        loc_image = clip.get("env_image_path")
         loc_row: dict[str, Any] | None = None
-        if scene.get("location_id"):
+        if clip.get("location_id"):
             loc = conn.execute(
                 "SELECT name, description, consistency_prompt, reference_image_path "
                 "FROM locations WHERE id = ?",
-                (scene["location_id"],),
+                (clip["location_id"],),
             ).fetchone()
             if loc:
                 loc_row = row_to_dict(loc)
@@ -235,19 +307,20 @@ async def preview_scene_prompt(
     finally:
         conn.close()
 
-    wf_id = workflow_id or scene.get("workflow_id")
+    scene = _scene_fields_from_clip(clip, characters)
+    wf_id = workflow_id or clip.get("workflow_id")
     workflow = _get_workflow(wf_id)
     if not workflow:
         raise ValueError("No enabled video workflow found — configure one in Settings")
     inputs = parse_dynamic_inputs(_workflow_json(workflow))
     profile = workflow.get("prompt_profile") or "prose"
-    based_on = _scene_prompt_hash(scene)
+    based_on = _clip_prompt_hash({**clip, "character_ids": [c["id"] for c in characters]})
 
     if profile == "minimax_h3_ref":
         # Fresh saved draft short-circuits the LLM call
-        draft = _stored_prompt_draft(scene)
+        draft = _stored_prompt_draft(clip)
         if draft:
-            meta = _scene_video_settings(scene).get("prompt_draft_meta") or {}
+            meta = _clip_video_settings(clip).get("prompt_draft_meta") or {}
             if meta.get("based_on") == based_on:
                 return {
                     "prompt": draft,
@@ -258,7 +331,7 @@ async def preview_scene_prompt(
         subjects, _ = _h3_subjects(characters, loc_row, loc_image, inputs)
         await event_bus.publish(
             "agent.thinking",
-            {"message": f"H3 prompt rewrite · scene {scene.get('order_index')}", "project_id": project_id},
+            {"message": f"H3 prompt rewrite · scene {clip.get('scene_order_index')} clip {clip.get('order_index')}", "project_id": project_id},
         )
         # Preview is interactive — fail fast to the deterministic template
         # instead of making the user wait out a dead endpoint.
@@ -268,10 +341,50 @@ async def preview_scene_prompt(
     return {"prompt": prompt, "profile": profile, "from_draft": False, "based_on": based_on}
 
 
+def _scene_fields_from_clip(
+    clip: dict[str, Any], characters: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """A scene-shaped dict whose action/dialog are narrowed to the clip's beat.
+
+    Both the prose and H3 prompt builders consume scene rows; feeding them this
+    projection means a clip's prompt contains only what that clip performs.
+    """
+    desc = (clip.get("description") or "").strip()
+    action = desc or (clip.get("action") or "").strip()
+    if desc and clip.get("shot_size"):
+        action = f"{clip['shot_size']} shot. {action}"
+    dialog = _clip_dialog(clip)
+    return {
+        "heading": clip.get("heading"),
+        "action": action,
+        "dialog": dialog,
+        "duration_sec": clip.get("duration_sec"),
+        "character_ids": [c["id"] for c in characters],
+    }
+
+
+def _clip_dialog(clip: dict[str, Any]) -> str | None:
+    """The dialog lines this clip performs (from dialog_lines_covered), verbatim."""
+    covered = clip.get("dialog_lines_covered")
+    if not covered:
+        return None
+    if isinstance(covered, str):
+        # Raw DB column is a JSON array string — parse before indexing.
+        try:
+            covered = json.loads(covered)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    idxs = covered if isinstance(covered, list) else []
+    lines = [ln for ln in (clip.get("dialog") or "").splitlines() if ln.strip()]
+    picked = [lines[i - 1] for i in idxs if isinstance(i, int) and 1 <= i <= len(lines)]
+    return "\n".join(picked) or None
+
+
 async def enqueue_video_jobs(
     project_id: int,
     *,
     scene_ids: list[int] | None = None,
+    clip_ids: list[int] | None = None,
     workflow_id: int | None = None,
     input_values_override: dict[str, Any] | None = None,
     prompts: dict[int, str] | None = None,
@@ -283,41 +396,41 @@ async def enqueue_video_jobs(
     conn = get_db(settings.db_path)
     jobs: list[dict[str, Any]] = []
     try:
-        query = "SELECT * FROM scenes WHERE project_id = ?"
-        params: list[Any] = [project_id]
-        if scene_ids:
-            placeholders = ",".join("?" * len(scene_ids))
-            query += f" AND id IN ({placeholders})"
-            params.extend(scene_ids)
-        query += " ORDER BY order_index"
-        scenes = [row_to_dict(r) for r in conn.execute(query, params).fetchall()]
+        clips = _fetch_clips(conn, project_id, scene_ids=scene_ids, clip_ids=clip_ids)
 
-        for scene in scenes:
+        for clip in clips:
+            scene_id = clip["scene_id"]
             # Supersede leftover pending jobs so a re-Generate always starts fresh
             conn.execute(
                 """
                 UPDATE jobs SET status = 'failed', error = 'superseded by new generate',
                 completed_at = CURRENT_TIMESTAMP
-                WHERE scene_id = ? AND kind = 'video' AND status = 'pending'
+                WHERE clip_id = ? AND kind = 'video' AND status = 'pending'
                 """,
-                (scene["id"],),
+                (clip["id"],),
             )
-            # Clear prior clip so UI shows generating instead of the old video
+            # Clear prior render so UI shows generating instead of the old video.
+            # Also NULL the scene's legacy mirror — COALESCE reads fall back to
+            # it, so a stale path there would resurrect the old render.
+            conn.execute(
+                "UPDATE clips SET clip_path = NULL WHERE id = ?",
+                (clip["id"],),
+            )
             conn.execute(
                 "UPDATE scenes SET video_path = NULL WHERE id = ?",
-                (scene["id"],),
+                (scene_id,),
             )
             # Commit BEFORE enqueue: queue_manager.enqueue writes on its own
             # connection, and holding this transaction open across that call
             # self-deadlocks (sqlite3.OperationalError: database is locked).
             conn.commit()
 
-            wf_id = workflow_id or scene.get("workflow_id")
+            wf_id = workflow_id or clip.get("workflow_id")
             workflow = _get_workflow(wf_id)
 
             workflow_json = _workflow_json(workflow)
             inputs = parse_dynamic_inputs(workflow_json) if workflow_json else []
-            duration = scene.get("duration_sec")
+            duration = clip.get("duration_sec") or clip.get("scene_duration_sec")
 
             char_rows = conn.execute(
                 """
@@ -325,30 +438,33 @@ async def enqueue_video_jobs(
                 JOIN scene_characters sc ON sc.character_id = c.id
                 WHERE sc.scene_id = ?
                 """,
-                (scene["id"],),
+                (scene_id,),
             ).fetchall()
             characters = [row_to_dict(r) for r in char_rows]
+            char_ids = [c["id"] for c in characters]
             char_image = next(
                 (c.get("sheet_path") or c.get("portrait_path") for c in characters if c.get("sheet_path") or c.get("portrait_path")),
                 None,
             )
-            loc_image = scene.get("env_image_path")
+            loc_image = clip.get("env_image_path")
             loc_row: dict[str, Any] | None = None
-            if scene.get("location_id"):
+            if clip.get("location_id"):
                 row = conn.execute(
                     "SELECT name, description, consistency_prompt, reference_image_path "
                     "FROM locations WHERE id = ?",
-                    (scene["location_id"],),
+                    (clip["location_id"],),
                 ).fetchone()
                 if row:
                     loc_row = row_to_dict(row)
                     if not loc_image:
                         loc_image = loc_row["reference_image_path"]
 
+            scene = _scene_fields_from_clip(clip, characters)
             profile = (workflow or {}).get("prompt_profile") or "prose"
-            # Merge base: saved per-scene setup first, explicit request wins on
+            hash_input = {**clip, "character_ids": char_ids}
+            # Merge base: saved per-clip setup first, explicit request wins on
             # top — so batch Generate-all honors persisted form setups.
-            stored_values = _stored_input_values(scene)
+            stored_values = _stored_input_values(clip)
             extra_values: dict[str, Any] = {**stored_values}
             if input_values_override:
                 extra_values.update(
@@ -357,13 +473,13 @@ async def enqueue_video_jobs(
             if profile == "minimax_h3_ref":
                 subjects, ref_paths = _h3_subjects(characters, loc_row, loc_image, inputs)
                 # Prompt precedence: explicit request → saved (fresh) draft → LLM.
-                explicit_prompt = (prompts or {}).get(scene["id"])
+                explicit_prompt = (prompts or {}).get(clip["id"])
                 fresh_draft = None
                 if explicit_prompt is None:
-                    candidate = _stored_prompt_draft(scene)
+                    candidate = _stored_prompt_draft(clip)
                     if candidate:
-                        meta = _scene_video_settings(scene).get("prompt_draft_meta") or {}
-                        if meta.get("based_on") == _scene_prompt_hash(scene):
+                        meta = _clip_video_settings(clip).get("prompt_draft_meta") or {}
+                        if meta.get("based_on") == _clip_prompt_hash(hash_input):
                             fresh_draft = candidate
                 if explicit_prompt is not None:
                     prompt = explicit_prompt
@@ -373,7 +489,7 @@ async def enqueue_video_jobs(
                     await event_bus.publish(
                         "agent.thinking",
                         {
-                            "message": f"H3 prompt rewrite · scene {scene.get('order_index')}",
+                            "message": f"H3 prompt rewrite · scene {clip.get('scene_order_index')} clip {clip.get('order_index')}",
                             "project_id": project_id,
                         },
                     )
@@ -386,7 +502,7 @@ async def enqueue_video_jobs(
                     extra=extra_values,
                 )
             else:
-                prompt = (prompts or {}).get(scene["id"]) or scene_video_prompt(
+                prompt = (prompts or {}).get(clip["id"]) or scene_video_prompt(
                     scene, characters
                 )
                 values = smart_fill_inputs(
@@ -397,7 +513,7 @@ async def enqueue_video_jobs(
                     duration=duration,
                     extra=extra_values,
                 )
-            # Stored per-scene setups override smart-fill's context choices
+            # Stored per-clip setups override smart-fill's context choices
             # (e.g. an edited duration). smart_fill skips duration-role nodes
             # in `extra` by design — re-apply them here, request values win.
             explicit_final = {
@@ -410,19 +526,22 @@ async def enqueue_video_jobs(
             payload: dict[str, Any] = {"input_values": values, "prompt": prompt}
             if session_id is not None:
                 payload["session_id"] = session_id
-            if scene.get("chain_from_prev"):
+            if clip.get("chain_from_prev"):
                 video_input = _video_input(inputs)
                 if not video_input:
                     raise ValueError(
-                        f"Scene {scene.get('order_index')} is marked continue-from-previous "
-                        f"but workflow '{(workflow or {}).get('name') or workflow_id}' has no "
+                        f"Clip {clip.get('scene_order_index')}.{clip.get('order_index')} is marked "
+                        f"continue-from-previous but workflow "
+                        f"'{(workflow or {}).get('name') or workflow_id}' has no "
                         "video input — pick a workflow with a (Input:video) node."
                     )
                 video_node_id = str(video_input["nodeId"])
                 if not values.get(video_node_id):
                     # Explicit clip from the form / input_values_override wins.
                     prev_clip, has_earlier = _previous_clip(
-                        conn, project_id, scene.get("order_index") or 0
+                        conn,
+                        project_id,
+                        (clip.get("scene_order_index") or 0, clip.get("order_index") or 0),
                     )
                     if prev_clip:
                         # Local path: the worker's prepare_media_inputs uploads it
@@ -431,28 +550,30 @@ async def enqueue_video_jobs(
                     elif has_earlier:
                         # Previous clip not generated yet (typical when a batch is
                         # queued in one go). The worker resolves it at RUN time —
-                        # the queue is concurrency-1, so the earlier scene's clip
+                        # the queue is concurrency-1, so the earlier clip
                         # will exist by then.
                         payload["continue_source"] = {
-                            "scene_order_index": scene.get("order_index"),
+                            "scene_order_index": clip.get("scene_order_index"),
+                            "clip_order_index": clip.get("order_index"),
                         }
                     else:
                         raise ValueError(
-                            f"Scene {scene.get('order_index')} is marked continue-from-previous "
-                            "but no previous clip exists yet — generate an earlier clip first "
-                            "or upload a video in the Video stage."
+                            f"Clip {clip.get('scene_order_index')}.{clip.get('order_index')} is marked "
+                            "continue-from-previous but no previous clip exists yet — generate an "
+                            "earlier clip first or upload a video in the Video stage."
                         )
             job = queue_manager.enqueue(
                 project_id=project_id,
                 kind="video",
                 workflow_id=workflow["id"] if workflow else None,
-                scene_id=scene["id"],
+                scene_id=scene_id,
+                clip_id=clip["id"],
                 payload=payload,
             )
-            if workflow and not scene.get("workflow_id"):
+            if workflow and not clip.get("workflow_id"):
                 conn.execute(
-                    "UPDATE scenes SET workflow_id = ? WHERE id = ?",
-                    (workflow["id"], scene["id"]),
+                    "UPDATE clips SET workflow_id = ? WHERE id = ?",
+                    (workflow["id"], clip["id"]),
                 )
             # Never hold a write lock across awaits (event publish below).
             conn.commit()
@@ -462,7 +583,7 @@ async def enqueue_video_jobs(
                 {
                     "job_id": job["id"],
                     "kind": "video",
-                    "message": f"Scene · {scene.get('heading') or scene.get('order_index')}",
+                    "message": _clip_label(clip),
                     "project_id": project_id,
                 },
             )
@@ -470,3 +591,9 @@ async def enqueue_video_jobs(
     finally:
         conn.close()
     return jobs
+
+
+def _clip_label(clip: dict[str, Any]) -> str:
+    """Human label: '#<scene>.<clip> · <heading>' (scene heading retained)."""
+    heading = (clip.get("heading") or f"Scene {clip.get('scene_order_index')}").strip()
+    return f"#{clip.get('scene_order_index')}.{clip.get('order_index')} · {heading}"

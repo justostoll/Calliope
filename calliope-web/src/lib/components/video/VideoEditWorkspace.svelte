@@ -4,7 +4,7 @@
 	 * Hero monitor + filmstrip + meta strip + docked Omni composer.
 	 * Does not reuse the old top two-card clip-stage layout.
 	 */
-	import type { Job, Scene, Workflow } from '$lib/api';
+	import type { Clip, Job, Scene, Workflow } from '$lib/api';
 	import OmniComposer from '$lib/components/OmniComposer.svelte';
 	import type { AssetOption } from '$lib/assetPicker';
 	import Icon from '$lib/components/ui/Icon.svelte';
@@ -12,8 +12,10 @@
 	import ClipSourceModal from './ClipSourceModal.svelte';
 	import JobInputsDrawer from './JobInputsDrawer.svelte';
 	import PromptPreviewModal from './PromptPreviewModal.svelte';
-	import SceneFilmstrip from './SceneFilmstrip.svelte';
+	import SceneFilmstrip, { type FilmstripClip } from './SceneFilmstrip.svelte';
 	import SceneScriptDrawer from './SceneScriptDrawer.svelte';
+import { t } from '$lib/i18n.svelte';
+	import ShotBrief from './ShotBrief.svelte';
 
 	type Thumb = { kind: 'image' | 'video'; src: string } | null;
 
@@ -39,26 +41,30 @@
 
 	interface Props {
 		scenes: Scene[];
+		/** Flattened clips in playback order — the filmstrip + selection units. */
+		filmClips: FilmstripClip[];
+		/** Selected clip (defaults to the scene's first when the scene has one clip). */
+		selectedClip: { clip: Clip; scene: Scene; index: number; label: string } | null;
+		selectedClipId: number | null;
 		selected: Scene;
-		selectedId: number | null;
 		status: string;
 		previewPath: string | null;
 		progress?: Progress | null;
 		error?: string;
 		errorLong?: boolean;
-	/** Latest video job for the scene — drives the "what was sent" drawer. */
+	/** Latest video job for the selected clip — drives the "what was sent" drawer. */
 	job?: Job | null;
-	/** All video jobs for the scene (history strip in the drawer). */
-	sceneJobs?: Job[];
+	/** All video jobs for the selected clip (history strip in the drawer). */
+	clipJobs?: Job[];
 		workflow: Workflow | undefined;
 		workflows: Workflow[];
 		formValues: Record<string, string | number>;
 		assetOptions: AssetOption[];
 		allowUpload?: boolean;
-		/** Disable Generate: scene continues from the previous video but the workflow cannot accept it. */
+		/** Disable Generate: clip continues from the previous video but the workflow cannot accept it. */
 		generateDisabled?: boolean;
 		generateDisabledReason?: string;
-	/** Where this continue scene's video input comes from (auto / upload / a timeline clip). */
+	/** Where this continue clip's video input comes from (auto / upload / a timeline clip). */
 	clipSource?: ClipSourceConfig;
 	onClipSourceChange?: (value: string) => void;
 	/** Upload file picked in the source modal — caller opens the file dialog. */
@@ -66,32 +72,33 @@
 	/** HITL prompt review before Generate: caller resolves + shows the modal. */
 	onPreviewPrompt?: () => void;
 	generateLabel?: string;
-		chained?: (scene: Scene) => boolean;
 		submitting?: boolean;
-		statusOf: (scene: Scene) => string;
-		thumbFor: (scene: Scene) => Thumb;
+		statusOfClip: (clipId: number) => string;
+		thumbForClip: (clipId: number) => Thumb;
 		formatClock: (sec: number) => string;
-		onSelect: (id: number) => void;
+		onSelectClip: (clipId: number) => void;
 		onStep: (dir: -1 | 1) => void;
 	onWorkflowChange: (id: number) => void;
 	onFormChange?: (values: Record<string, string | number>) => void;
 	onGenerate: () => void;
-	/** Render-history versioning: apply an older job's output to the scene. */
-	onApplyToScene?: (job: Job, path: string) => void;
+	/** Render-history versioning: apply an older job's output to the clip. */
+	onApplyToClip?: (job: Job, path: string) => void;
 	applying?: boolean;
 	}
 
 	let {
 		scenes,
+		filmClips,
+		selectedClip,
+		selectedClipId,
 		selected,
-		selectedId,
 		status,
 		previewPath,
 		progress = null,
 		error = '',
 		errorLong = false,
 		job = null,
-		sceneJobs = [],
+		clipJobs = [],
 		workflow,
 		workflows,
 		formValues = $bindable(),
@@ -103,18 +110,17 @@
 		onClipSourceChange,
 		onClipSourceUpload,
 		onPreviewPrompt,
-		generateLabel = 'Generate clip',
-		chained = () => false,
+		generateLabel = '',
 		submitting = false,
-		statusOf,
-		thumbFor,
+		statusOfClip,
+		thumbForClip,
 		formatClock,
-		onSelect,
+		onSelectClip,
 		onStep,
 		onWorkflowChange,
 		onFormChange,
 		onGenerate,
-		onApplyToScene,
+		onApplyToClip,
 		applying = false,
 	}: Props = $props();
 
@@ -133,55 +139,55 @@
 	const clipSourceLabel = $derived.by(() => {
 		if (!clipSource?.enabled) return '';
 		const val = clipSource.value;
-		if (val === 'auto') return 'Auto (previous clip)';
-		if (val === 'upload') return 'Upload file';
-		return clipSource.options.find((o) => o.id === val)?.label ?? 'Auto (previous clip)';
+		if (val === 'auto') return t('clipSource.autoName');
+		if (val === 'upload') return t('clipSource.uploadName');
+		return clipSource.options.find((o) => o.id === val)?.label ?? t('clipSource.autoName');
 	});
 </script>
 
 <div class="workspace">
-	<div class="hero">
-		<ClipMonitor
-			{previewPath}
-			{status}
-			heading={selected.heading || 'Untitled'}
-			orderIndex={selected.order_index}
-			sceneId={selected.id}
-			{progress}
-			{error}
-			{errorLong}
+<div class="preview-col">
+		<div class="hero">
+			<ClipMonitor
+				{previewPath}
+				{status}
+				heading={(selectedClip?.clip.description || selected.heading || t('clipMonitor.untitled')).slice(0, 80)}
+				orderIndex={selected.order_index}
+				label={selectedClip?.label}
+				idLabel={selectedClip ? t('videoEdit.clipId', { id: selectedClip.clip.id }) : selected ? t('videoEdit.sceneId', { id: selected.id }) : undefined}
+				sceneId={selectedClip?.scene.id ?? selected?.id}
+				{progress}
+				{error}
+				{errorLong}
+			/>
+		</div>
+
+		<SceneFilmstrip
+			clips={filmClips}
+			{selectedClipId}
+			{statusOfClip}
+			{thumbForClip}
+			{formatClock}
+			{onSelectClip}
+			{onStep}
 		/>
+
+		<SceneScriptDrawer scene={selected} {status} {formatClock} />
 	</div>
 
-	<SceneFilmstrip
-		{scenes}
-		{selectedId}
-		{statusOf}
-		{thumbFor}
-		{formatClock}
-		{chained}
-		{onSelect}
-		{onStep}
-	/>
-
-	<SceneScriptDrawer scene={selected} {status} {formatClock} />
-
-	<div class="composer-dock">
+	<aside class="dock-col" aria-label={t('videoEdit.dockAria')}>
 		{#if workflow}
 			{#if generateDisabled}
 				<div class="continue-warning" role="alert">
 					<Icon name="alert" size={16} />
 					<div class="continue-warning-text">
-						<span class="continue-warning-title">Workflow has no video input</span>
-						<span>
-							This scene continues from the previous video. Switch to a workflow that has a video
-							input (LoadVideo node tagged (Input:video)).
-						</span>
+						<span class="continue-warning-title">{t('videoEdit.noVideoInputWf')}</span>
+						<span>{t('videoEdit.continueHint')}</span>
 					</div>
 				</div>
 			{:else if clipSource?.enabled}
-			<div class="clip-source-row">
-				<span class="clip-source-label" id="clip-source-label">Video source</span>
+<div class="clip-source-row">
+				<span class="clip-source-label" id="clip-source-label">{t('videoEdit.videoSource')}</span>
 				<button
 					type="button"
 					class="clip-source-trigger"
@@ -204,10 +210,7 @@
 			/>
 		{/if}
 		{#if assetOptions.length === 0}
-			<p class="asset-hint">
-				No refs yet. Generate character sheets or environments in Assets, or upload a video/audio
-				file here.
-			</p>
+			<p class="asset-hint">{t('videoEdit.assetHint')}</p>
 		{/if}
 		{#if hasJobPayload}
 			<div class="job-inputs-row">
@@ -219,53 +222,72 @@
 					onclick={() => (inputsOpen = true)}
 				>
 					<Icon name="info" size={14} />
-					<span>View prompt &amp; inputs</span>
+					<span>{t('videoEdit.viewPrompt')}</span>
 				</button>
 			</div>
 			<JobInputsDrawer
 				bind:open={inputsOpen}
 				{job}
-				jobs={sceneJobs}
+				jobs={clipJobs}
 				{workflow}
-				sceneVideoPath={selected.video_path}
+				sceneVideoPath={selectedClip?.clip.clip_path ?? selected.video_path}
 				onCopySettings={(values) => {
 					formValues = { ...formValues, ...values };
 					onFormChange?.({ ...formValues });
 				}}
-				onApplyToScene={(j, path) => onApplyToScene?.(j, path)}
+				onApplyToScene={(j, path) => onApplyToClip?.(j, path)}
 				applying={applying}
 			/>
 		{/if}
+{#if selectedClip}
+				<ShotBrief
+					clip={selectedClip.clip}
+					scene={selectedClip.scene}
+					label={selectedClip.label}
+					{formatClock}
+				/>
+			{/if}
 			<OmniComposer
 				inputs={workflow.input_schema}
 				bind:values={formValues}
 				{workflow}
 				{workflows}
 				onWorkflowChange={onWorkflowChange}
-			{assetOptions}
-			{allowUpload}
-			{generateLabel}
-			{submitting}
-			disabled={generateDisabled}
-			generateDisabledHint={generateDisabledReason}
-			onChange={onFormChange}
-			onSubmit={onPreviewPrompt ?? onGenerate}
-		/>
+{assetOptions}
+				{allowUpload}
+				generateLabel={generateLabel || t('videoEdit.generateLabel')}
+				{submitting}
+				disabled={generateDisabled}
+				generateDisabledHint={generateDisabledReason}
+				onChange={onFormChange}
+				onSubmit={onPreviewPrompt ?? onGenerate}
+			/>
 		{:else}
 			<div class="no-wf">
-				<p class="empty-title">No video workflow enabled</p>
+				<p class="empty-title">{t('videoEdit.noWf')}</p>
 				<p class="muted">
-					Enable a video workflow in <a href="/settings?tab=workflows">Settings → Workflows</a>.
+					{t('videoEdit.enableWfPre')} <a href="/settings?tab=workflows">{t('videoEdit.wfLink')}</a>{t('videoEdit.enableWfPost')}
 				</p>
 			</div>
 		{/if}
-	</div>
+	</aside>
 </div>
 
 <style>
+	/* Two columns: the player + strip own the left, every generation input
+	   lives in the right inspector so it can't push the player out of view. */
 	.workspace {
 		flex: 1;
 		min-height: 0;
+		display: flex;
+		flex-direction: row;
+		gap: 12px;
+		overflow: hidden;
+	}
+
+	.preview-col {
+		flex: 1 1 auto;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
@@ -273,8 +295,8 @@
 	}
 
 	.hero {
-		flex: 1;
-		min-height: 140px;
+		flex: 1 1 auto;
+		min-height: 200px;
 		display: flex;
 		align-items: stretch;
 		justify-content: stretch;
@@ -282,13 +304,37 @@
 		width: 100%;
 	}
 
-	.composer-dock {
-		flex-shrink: 0;
-		min-height: 0;
+	/* Inspector — scrolls on its own so the player keeps the height. */
+	.dock-col {
+		flex: 0 0 clamp(300px, 34%, 400px);
+		min-width: 280px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		padding-right: 2px;
 	}
 
-	.composer-dock :global(.omni-shell) {
+	.dock-col :global(.omni-shell) {
 		flex-shrink: 0;
+	}
+
+	/* Very narrow: stack, player first. */
+	@media (max-width: 900px) {
+		.workspace {
+			flex-direction: column;
+			overflow-y: auto;
+		}
+
+		.preview-col {
+			overflow: visible;
+		}
+
+		.dock-col {
+			flex: 0 0 auto;
+			overflow: visible;
+		}
 	}
 
 	.continue-warning {
@@ -296,7 +342,7 @@
 		align-items: flex-start;
 		gap: 10px;
 		padding: 10px 12px;
-		margin: 0 0 8px;
+		margin: 0;
 		border-radius: var(--radius-md);
 		border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
 		background: color-mix(in srgb, var(--warning) 10%, var(--bg-surface));
@@ -325,7 +371,7 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		margin: 0 0 8px;
+		margin: 0;
 	}
 
 	.clip-source-label {
@@ -338,7 +384,8 @@
 		display: inline-flex;
 		align-items: center;
 		gap: 8px;
-		max-width: 360px;
+		max-width: 100%;
+		min-width: 0;
 		padding: 6px 12px;
 		font: inherit;
 		font-size: 13px;
@@ -369,7 +416,7 @@
 	}
 
 	.asset-hint {
-		margin: 0 0 8px;
+		margin: 0;
 		font-size: 12px;
 		color: var(--text-muted);
 		line-height: 1.4;
@@ -378,7 +425,7 @@
 	.job-inputs-row {
 		display: flex;
 		justify-content: flex-end;
-		margin: 0 0 6px;
+		margin: 0;
 	}
 
 	.job-inputs-trigger {

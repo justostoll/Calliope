@@ -87,6 +87,125 @@ def test_assets_role_scope_includes_canvas_posting():
             assert registry.get(name) is not None, f"{role} names unknown tool {name}"
 
 
+def test_story_role_can_structure_beats_into_scenes():
+    """Session 908 regression: the planner scheduled 'create 8 scenes via
+    add_scene' as a STORY task, but add_scene lived only in the script role —
+    the story agent reported 'Tool not available to this role: add_scene',
+    scenes were never created, and the build stalled with nothing in the
+    project DB. Scene-authoring basics belong to the story role too."""
+    tools = orchestrator.ROLE_TOOLS["story"]
+    assert "add_scene" in tools
+    assert "list_scenes" in tools
+
+
+def test_sub_agent_payload_keeps_render_tools_visible():
+    """Session 908 regression: a planner-scheduled video render task must see
+    enqueue_video_jobs in its payload even without prose render intent — the
+    scoped payload filters requires_project/blind_only/scene-scope only, and
+    PERMISSION is enforced at execute time (guard denial teaches ask_user).
+    The old _visible()-based filter hid the tools entirely, so the sub-agent
+    ended with 'the generation tool is not exposed in this session's
+    toolset' and the render never happened."""
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.names: list[str] = []
+
+        def __call__(self, fn):
+            self.names.append(fn.__name__)
+            return fn
+
+    import calliope.agent.harness.orchestrator as orch
+
+    # No user/message events at all → user_allows_render is False, so the
+    # old payload filter would have dropped every requires_approval tool.
+    payload = orch._scoped_payload(
+        ToolContext(session_id=999_001, project_id=1),
+        orchestrator.ROLE_TOOLS["video"],
+    )
+    names = {p["function"]["name"] for p in payload}
+    assert "enqueue_video_jobs" in names
+    assert "run_workflow" in names
+    # Sanity: truly project-scoped tools still filter for blind contexts.
+    blind = orch._scoped_payload(
+        ToolContext(session_id=999_001, project_id=None),
+        orchestrator.ROLE_TOOLS["video"],
+    )
+    blind_names = {p["function"]["name"] for p in blind}
+    assert "enqueue_video_jobs" not in blind_names
+    assert "get_workspace" in blind_names  # requires_project=False
+
+
+def test_execute_time_render_guard_still_blocks_without_intent():
+    """The payload fix must not weaken the execute-time gate: with no render
+    intent, calling enqueue_video_jobs still returns the HITL denial (which
+    instructs ask_user) rather than executing."""
+    import json as _json
+
+    from calliope.agent.harness import build_harness, get_registry
+
+    build_harness()
+    registry = get_registry()
+    # Session 999_002 has no events → no render permission.
+    result = asyncio.run(
+        registry.execute(
+            ToolContext(session_id=999_002, project_id=1),
+            "enqueue_video_jobs",
+            {"scene_ids": [1]},
+        )
+    )
+    assert result.get("ok") is False
+    assert result.get("reason_code") == "guard_render_approval"
+    assert "ask" in _json.dumps(result).lower()
+
+
+def test_swarm_roles_cover_pipeline_categories():
+    """Drift guard (both directions): every registered tool in a pipeline
+    category must appear in its ROLE_TOOLS role — the clip tools drifted out
+    of the script/video roles while the dead-name check above stayed green,
+    because nothing checked the orphan direction.
+
+    Deliberately role-less categories are excluded: canvas / interaction /
+    memory / skills / shot / workspace / project / system are main-loop-only
+    or shared base reads.
+    """
+    from calliope.agent.harness import build_harness
+
+    registry, _ = build_harness()
+    category_roles = {
+        "story": {"story"},
+        "script": {"script"},
+        "assets": {"assets"},
+        "video": {"video"},
+    }
+    # Story-category ENTITY CRUD is planner-routed to the assets role (the
+    # standard EDIT pipeline: story → script → "add/update assets text") —
+    # only beats stay with the story role.
+    overrides = {
+        name: {"assets"}
+        for name in (
+            "add_character",
+            "update_character",
+            "delete_character",
+            "add_location",
+            "update_location",
+            "delete_location",
+            "add_item",
+            "update_item",
+            "delete_item",
+        )
+    }
+    for t in registry.tools.values():
+        roles = overrides.get(t.name) or category_roles.get(t.category)
+        if not roles:
+            continue
+        for role in roles:
+            assert t.name in orchestrator.ROLE_TOOLS[role], (
+                f"{t.category}-category tool '{t.name}' is missing from the "
+                f"'{role}' swarm role — sub-agents cannot perform it"
+            )
+
+
 def test_unscoped_enqueue_refused_when_many_missing():
     """Mechanical scope: an unscoped enqueue_asset_jobs that would touch
     more than 3 entities is refused with the count, so '2 characters' can

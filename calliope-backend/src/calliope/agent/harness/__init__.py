@@ -35,6 +35,14 @@ logger = logging.getLogger("calliope.harness")
 # human guidance text stays in the deny message for the model).
 GUARD_RENDER_APPROVAL = "guard_render_approval"
 GUARD_DESTRUCTIVE_REPLACE = "guard_destructive_replace"
+# Scene tool scope guard lives in registry.py (circular-import free); the
+# contracts exporter reads guard codes from THIS module, so re-export here.
+from calliope.agent.harness.registry import (  # noqa: E402
+    GUARD_SCENE_TOOL_SCOPE,
+    GUARD_NO_EXPORT_VIDEO_TOOL,
+    EXPORT_VIDEO_DENIED_NAMES,
+    _scene_scoped,
+)
 
 # Re-exports for tests / older imports.
 _is_confirmation = is_confirmation
@@ -183,20 +191,22 @@ def _destructive_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> PreEx
     )
     if replace:
         return deny(
-            counts + " replace=true DELETES all of it first. Ask the user to "
-            "confirm before replacing; once they confirm (e.g. 'yes, replace'), "
-            "call this tool again. For targeted changes use the granular tools "
-            "instead (add/update/delete for beats, characters, locations, "
-            "items, scenes).",
+            counts + " replace=true DELETES all of it first, and the user's "
+            "latest message did not ask for a replacement. Ask them once "
+            "(ask_user or plain text: 'replace the existing content?'); "
+            "after ANY affirmative reply, retry replace=true — it will be "
+            "allowed. Do not retry replace=true again before they answer; "
+            "do not call get_workspace repeatedly instead. For targeted "
+            "changes use the granular tools (add/update/delete) instead.",
             code=GUARD_DESTRUCTIVE_REPLACE,
         )
     return deny(
-        counts + " replace=false would APPEND a second full set alongside the "
-        "existing content (e.g. doubling the beat list) — usually wrong. Ask "
-        "the user to confirm before appending; once they confirm (e.g. 'yes, "
-        "append'), call this tool again. For targeted changes use the granular "
-        "tools instead (add/update/delete for beats, characters, locations, "
-        "items, scenes).",
+        counts + " replace=false would APPEND a second full set alongside "
+        "the existing content (e.g. doubling the beat list). Ask the user "
+        "whether to replace or append; after ANY affirmative reply retry — "
+        "it will be allowed. Do not retry either mode again before they "
+        "answer. For targeted changes use the granular tools "
+        "(add/update/delete) instead.",
         code=GUARD_DESTRUCTIVE_REPLACE,
     )
 
@@ -221,6 +231,7 @@ def build_harness() -> tuple[ToolRegistry, SystemPromptService]:
         memory,
         render,
         script,
+        shot_builder,
         skills,
         story,
         workspace,
@@ -234,6 +245,7 @@ def build_harness() -> tuple[ToolRegistry, SystemPromptService]:
     interaction.register(registry)
     memory.register(registry)
     skills.register(registry)
+    shot_builder.register(registry)
     registry.on_pre_execute(_destructive_guard)
     registry.on_pre_execute(_render_approval_guard)
     register_builtin_sections(prompts)
