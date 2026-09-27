@@ -288,3 +288,15 @@ def test_h3_ref_prompt_uses_only_the_fixed_retention_markers():
     videos = [{"index": 1, "path": "fight.mp4", "name": "fight.mp4"}]
     text = minimax_h3_ref_fallback({"heading": "INT. HALL", "action": "He runs."}, [], videos)
     assert "<Video 1> (camera movement and action timing): attribute_transfer - " in text
+
+
+def test_h3_ref_prompt_keeps_an_expanded_clip_to_one_shot():
+    """Since 1.5.0 a broken-down clip is a single shot; the rewrite must not cut inside it.
+
+    video_agent._scene_fields_from_clip prefixes an expanded clip's action with
+    "<shot_size> shot."; the sizes are coverage_agent's valid_sizes.
+    """
+    for size in ("wide", "medium", "closeUp", "insert", "overShoulder"):
+        assert f"'{size} shot.'" in MINIMAX_H3_REF_SYSTEM
+    assert "write only '[Shot 1]'" in MINIMAX_H3_REF_SYSTEM
+    assert "Otherwise use the shot budget by scene duration" in MINIMAX_H3_REF_SYSTEM
