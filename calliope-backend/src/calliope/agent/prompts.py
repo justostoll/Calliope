@@ -859,7 +859,7 @@ def minimax_h3_ref_fallback(
             "Preserve its camera movement, action timing, and physical performance."
         )
         retention.append(
-            f"<Video {v['index']}> (motion across [Shot 1]): motion_preserved - "
+            f"<Video {v['index']}> (camera movement and action timing): attribute_transfer - "
             "camera path, timing, and physical performance from the reference video "
             "are retained."
         )
