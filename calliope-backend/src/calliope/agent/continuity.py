@@ -440,6 +440,17 @@ def _board_digest(board: dict[str, Any]) -> str:
     return text
 
 
+def _h3_extra_body() -> dict[str, Any] | None:
+    """The H3 rewrite's per-call request extras, reused by the plan and the critic.
+
+    Both run inside the H3 compile path on the same model as the rewrite. With a
+    thinking model and no extras they spend thousands of reasoning tokens on a
+    JSON answer (measured on this host: critic 4,108 tokens / 145 s for
+    {"ok": true, "notes": []}), so they take the setting that turns it off there.
+    """
+    return settings.h3_rewrite_extra_body or None
+
+
 async def _llm_plan(board: dict[str, Any]) -> dict[str, Any]:
     client = LLMClient.for_role("video", timeout=PLAN_TIMEOUT_SEC)
     try:
@@ -452,6 +463,7 @@ async def _llm_plan(board: dict[str, Any]) -> dict[str, Any]:
                 },
             ],
             temperature=0.2,
+            extra_body=_h3_extra_body(),
         )
         data = extract_json(raw)
     finally:
@@ -549,7 +561,7 @@ async def _critic_reply(client: LLMClient, messages: list[dict[str, Any]]) -> di
     Local models often answer the check in prose. That is a parse miss, not a
     dead endpoint, so the retry asks for a JSON object before giving up.
     """
-    raw = await client.chat(messages, temperature=0.0)
+    raw = await client.chat(messages, temperature=0.0, extra_body=_h3_extra_body())
     try:
         data = extract_json(raw)
     except ValueError as exc:
@@ -558,6 +570,7 @@ async def _critic_reply(client: LLMClient, messages: list[dict[str, Any]]) -> di
             messages,
             temperature=0.0,
             response_format={"type": "json_object"},
+            extra_body=_h3_extra_body(),
         )
         data = extract_json(raw)
     if not isinstance(data, dict):

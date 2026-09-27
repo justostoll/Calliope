@@ -463,3 +463,58 @@ def test_refresh_tool_is_on_the_script_role(client, monkeypatch):
         t_refresh_continuity_plan(ToolContext(session_id=1, project_id=pid), {})
     )
     assert result == {"ok": True, "based_on": "abc", "shots": 2, "refreshed": True}
+
+
+def test_plan_and_critic_send_the_h3_request_extras(client, monkeypatch):
+    """The plan, the critic and its JSON-mode retry all carry h3_rewrite_extra_body.
+
+    On a thinking model that setting is what turns reasoning off; without it the
+    two calls spent 216 s and 145 s here on JSON answers.
+    """
+    from calliope.agent.continuity import critique_prompt
+
+    extras = {"chat_template_kwargs": {"enable_thinking": False}}
+    monkeypatch.setattr(settings, "h3_rewrite_extra_body", extras)
+    pid = _mk_project(client, "Extras")
+    scene = _add_scene(client, pid, 1, action="Maya opens the door.")
+    clip = _clip_id(pid, scene["id"])
+    seen: list[tuple[str, object]] = []
+
+    class Scripted:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @classmethod
+        def for_role(cls, role, timeout=120.0):
+            return cls()
+
+        async def chat(
+            self, messages, temperature=0.2, response_format=None, extra_body=None, **kwargs
+        ):
+            if response_format:
+                kind = "retry"
+            else:
+                kind = "plan" if "ledger" in messages[-1]["content"] else "critic"
+            seen.append((kind, extra_body))
+            if kind == "plan":
+                return json.dumps(
+                    {"overview": {}, "requirements": {}, "shots": [{"clip_id": clip}]}
+                )
+            if kind == "critic":
+                return "prose, not JSON"
+            return json.dumps({"ok": True, "notes": []})
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("calliope.agent.continuity.LLMClient", Scripted)
+    plan = asyncio.run(ensure_continuity_plan(pid))
+    result = asyncio.run(critique_prompt("compiled", plan, clip))
+    assert result["ok"] is True
+    assert [k for k, _ in seen] == ["plan", "critic", "retry"]
+    assert all(body == extras for _, body in seen)
+
+    monkeypatch.setattr(settings, "h3_rewrite_extra_body", {})
+    seen.clear()
+    asyncio.run(critique_prompt("compiled", plan, clip))
+    assert seen and all(body is None for _, body in seen)
