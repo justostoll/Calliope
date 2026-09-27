@@ -276,7 +276,7 @@ def test_oversized_script_durations_shrink_to_target(monkeypatch):
     from calliope.config import settings
     from calliope.db import get_db
 
-    async def fake_structured(messages, temperature=0.7):
+    async def fake_structured(messages, temperature=0.7, **_kw):  # local salvage kwargs
         n = 0
         for line in messages[1]["content"].splitlines():
             if line.startswith("THIS CHUNK:"):
