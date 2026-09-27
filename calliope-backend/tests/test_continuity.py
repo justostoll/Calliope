@@ -465,11 +465,11 @@ def test_refresh_tool_is_on_the_script_role(client, monkeypatch):
     assert result == {"ok": True, "based_on": "abc", "shots": 2, "refreshed": True}
 
 
-def test_plan_and_critic_send_the_h3_request_extras(client, monkeypatch):
-    """The plan, the critic and its JSON-mode retry all carry h3_rewrite_extra_body.
+def test_plan_sends_the_h3_request_extras_and_the_critic_does_not(client, monkeypatch):
+    """The plan carries h3_rewrite_extra_body; the critic and its retry do not.
 
-    On a thinking model that setting is what turns reasoning off; without it the
-    two calls spent 216 s and 145 s here on JSON answers.
+    On a thinking model that setting turns reasoning off. The plan stays sound
+    without it (216 s -> 65 s here); the critic got fast but wrong, so it thinks.
     """
     from calliope.agent.continuity import critique_prompt
 
@@ -511,10 +511,9 @@ def test_plan_and_critic_send_the_h3_request_extras(client, monkeypatch):
     plan = asyncio.run(ensure_continuity_plan(pid))
     result = asyncio.run(critique_prompt("compiled", plan, clip))
     assert result["ok"] is True
-    assert [k for k, _ in seen] == ["plan", "critic", "retry"]
-    assert all(body == extras for _, body in seen)
+    assert seen == [("plan", extras), ("critic", None), ("retry", None)]
 
     monkeypatch.setattr(settings, "h3_rewrite_extra_body", {})
     seen.clear()
-    asyncio.run(critique_prompt("compiled", plan, clip))
-    assert seen and all(body is None for _, body in seen)
+    asyncio.run(ensure_continuity_plan(pid, force=True))
+    assert seen == [("plan", None)]
