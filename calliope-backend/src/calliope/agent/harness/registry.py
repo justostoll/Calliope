@@ -48,9 +48,13 @@ EXPORT_VIDEO_DENIED_NAMES = frozenset({"export_video", "exportVideo"})
 
 
 def _tool_timeout_sec() -> float:
-    """Per-tool wall-clock cap from Settings; 0 = disabled."""
+    """Wall-clock cap for one agent tool call: Settings → Queue → Timeout.
+
+    Same value as the ComfyUI job poll (``queue_poll_timeout_sec``). 0 waits
+    until the tool finishes.
+    """
     try:
-        t = float(settings.agent_tool_timeout_sec)
+        t = float(settings.queue_poll_timeout_sec)
     except (TypeError, ValueError, AttributeError):
         return 0.0
     return max(0.0, t)
@@ -91,8 +95,9 @@ class ToolDefinition:
     category: str = "general"
     destructive: bool = False  # flagged in descriptions; pre-execute guard uses it
     requires_approval: bool = False  # HITL: blocked unless the user explicitly asked
-    # True → exempt from the per-tool wall-clock timeout (agent_tool_timeout_sec);
-    # the tool owns its own wait contract (e.g. wait_for_jobs → queue_poll_timeout_sec).
+    # True → exempt from the Queue timeout wall clock;
+    # the tool owns its own wait contract (e.g. wait_for_jobs uses the same
+    # queue_poll_timeout_sec, including 0 = wait until done).
     long_running: bool = False
 
 
@@ -173,6 +178,12 @@ class ToolRegistry:
         if t.requires_project and ctx.project_id is None:
             return False
         if t.blind_only and ctx.project_id is not None:
+            return False
+        # shot_* tools exist ONLY on the Build Scene surface (origin='scene').
+        # A chat-origin session (AI Canvas, main loop) should not see 23 shot
+        # tools it can never legitimately use — payload noise at best, wasted
+        # calls at worst.
+        if t.category == "shot" and ctx.origin != "scene":
             return False
         # Build Scene surface: shot tools + minimal base ONLY. A missing tool
         # is harder to misuse than one that fails at execute time.
@@ -281,8 +292,8 @@ class ToolRegistry:
         try:
             result = await self._execute_with_timeout(t, ctx, args)
         except TimeoutError:
-            # Per-tool wall-clock cap (0 = disabled): a hung tool must stall
-            # its step, not the session. CancelledError passes through so the
+            # Per-tool wall clock is Settings → Queue → Timeout. 0 waits
+            # until the tool finishes. CancelledError passes through so the
             # Stop button keeps working.
             return {
                 "ok": False,

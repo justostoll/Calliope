@@ -88,6 +88,7 @@ export interface Settings {
 	port: number;
 	data_dir: string;
 	assets_dir: string;
+	agent_workspace_dir: string;
 	db_name: string;
 	llm_base_url: string;
 	llm_model: string;
@@ -101,7 +102,9 @@ export interface Settings {
 	queue_max_retries: number;
 	agent_max_steps: number;
 	agent_hardening_prompt: string;
+	agent_history_char_budget: number;
 	agent_llm_assignments: Record<string, string | null>;
+	agent_shell_enabled: boolean;
 	dry_run: boolean;
 }
 
@@ -324,13 +327,20 @@ export const jobsApi = {
 		}),
 	previewPrompt: (
 		projectId: number,
-		payload: { clip_id?: number; scene_id?: number; workflow_id?: number },
+		payload: {
+			clip_id?: number;
+			scene_id?: number;
+			workflow_id?: number;
+			input_values?: Record<string, unknown>;
+			force?: boolean;
+		},
 	) =>
 		api<{
 			prompt: string;
 			profile: string;
 			from_draft: boolean;
 			based_on: string;
+			critic?: { ok: boolean; notes: string[] };
 		}>(`/api/jobs/projects/${projectId}/preview-prompt`, {
 			method: 'POST',
 			body: JSON.stringify(payload),

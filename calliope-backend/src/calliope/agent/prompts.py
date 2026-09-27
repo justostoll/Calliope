@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 
@@ -16,9 +17,10 @@ SCRIPT_GENERATION_SYSTEM = (
     "You are a screenwriter for AI video production. "
     "Write a scene-by-scene script that uses the provided characters and locations. "
     "A scene is a SCREENPLAY unit — a heading, full action prose, and all dialogue that plays "
-    "in it — exactly like a produced script. Scenes may be long; a later 'break into shots' "
-    "pass splits each scene into short renderable clips, so never compress the content to fit "
-    "a single video generation. "
+    "in it — exactly like a produced script. A later 'break into shots' pass splits each scene "
+    "into short renderable clips, so never compress what a scene needs to say — but scale the "
+    "TOTAL material to the runtime budget given in the user message: a 30-second film needs "
+    "30 seconds of action and dialogue, not two minutes. "
     "Always respond with a single valid JSON object. "
     "HARD RULE: the scenes array length must equal required_scene_count from the user message. "
     "Returning fewer scenes is a failure. Respect the user's chosen scene count."
@@ -313,6 +315,9 @@ def build_script_messages(
     scene_n = max(recommended, int(scene_count)) if scene_count and scene_count > 0 else recommended
     # Stretch runtime floor when the user asked for more clips than duration alone implies
     secs = max(secs, scene_n * 6)
+    # Issue #64: the target is a budget, not a floor — give the model a concrete
+    # per-scene scale to write to so content volume matches the runtime.
+    per_scene_secs = max(3, round(secs / scene_n))
     char_lines = "\n".join(
         f"- id={c['id']} {c['name']} ({c.get('role') or ''}): {c.get('appearance') or ''}"
         for c in characters
@@ -328,8 +333,10 @@ def build_script_messages(
 Title: {title}
 Idea: {idea or ''}
 Target duration: {target_duration or 'short (~30-60 seconds)'}
-Estimated runtime: ~{secs} seconds
+Estimated runtime: ~{secs} seconds TOTAL — the finished film must play in about {secs}s
 required_scene_count: {scene_n}
+Per-scene budget: ~{per_scene_secs} seconds each (sum across scenes ≈ {secs}s) — write
+action length and dialogue VOLUME to this scale.
 
 Story beats:
 {beat_lines or '(none)'}
@@ -344,9 +351,10 @@ Locations:
 1. The JSON field "scenes" MUST contain EXACTLY {scene_n} objects.
 2. order_index must run 1, 2, 3, ... {scene_n} with no gaps.
 3. Do NOT collapse back to fewer scenes. The user expanded the script to {scene_n} scenes — fill all of them.
-4. Spread the full story across all {scene_n} scenes. A scene is a SCREENPLAY unit — it may
-   run 30–120 seconds when the material needs it (a later pass breaks long scenes into
-   short renderable clips). NEVER compress or summarize action to make a scene shorter.
+4. Spread the full story across all {scene_n} scenes. A scene is a SCREENPLAY unit — long scenes
+   are fine ONLY when the {secs}s total allows (≈{per_scene_secs}s each). Scale action detail
+   and the NUMBER of dialogue lines to that per-scene budget; do not write 2 minutes of
+   material into a {secs}s film. Never drop lines the story needs — write fewer instead.
 5. Pace the total toward ~{secs} seconds overall — scenes with lots of dialogue run longer.
 
 === ACTION (full visible action prose — the fidelity contract) ===
@@ -421,6 +429,8 @@ def build_script_chunk_messages(
     continuity — heading style, location, who's on screen — without resending
     the whole script."""
     secs = estimate_target_seconds(target_duration)
+    # Issue #64: per-scene budget so chunk content volume matches the runtime.
+    per_scene_secs = max(3, round(secs / scene_count))
     char_lines = "\n".join(
         f"- id={c['id']} {c['name']} ({c.get('role') or ''}): {c.get('appearance') or ''}"
         for c in characters
@@ -448,7 +458,10 @@ def build_script_chunk_messages(
 Title: {title}
 Idea: {idea or ''}
 Target duration: {target_duration or 'short (~30-60 seconds)'}
+Estimated runtime: ~{secs} seconds TOTAL — the finished film must play in about {secs}s
 required_scene_count: {scene_count}
+Per-scene budget: ~{per_scene_secs} seconds each (sum across the whole script ≈ {secs}s) —
+write action length and dialogue VOLUME to this scale.
 THIS CHUNK: exactly {chunk_scenes} scenes, order_index {chunk_start} through {last}.
 Full script is {scene_count} scenes; other chunks are written separately — do NOT write
 scenes outside {chunk_start}..{last}.
@@ -465,9 +478,11 @@ Locations:
 === HARD CONSTRAINTS (non-negotiable) ===
 1. The JSON field "scenes" MUST contain EXACTLY {chunk_scenes} objects.
 2. order_index must run {chunk_start}, {chunk_start + 1}, ... {last} with no gaps.
-3. A scene is a SCREENPLAY unit — it may run 30–120 seconds when the material needs it
-   (a later pass breaks long scenes into short renderable clips). NEVER compress or
-   summarize action to make a scene shorter.
+3. A scene is a SCREENPLAY unit — long scenes are fine ONLY when the {secs}s total allows
+   (≈{per_scene_secs}s each). Scale action detail and the NUMBER of dialogue lines to that
+   per-scene budget; do not write 2 minutes of material into a {secs}s film. Never drop
+   lines the story needs — write fewer instead. A later pass breaks scenes into renderable
+   clips, so never compress what a scene needs to SAY.
 4. Advance the beat arc across the whole {scene_count}-scene story; this chunk covers
    the part that falls at scenes {chunk_start}–{last}.
 5. If earlier scenes are listed above, continue them naturally — same characters,
@@ -636,9 +651,10 @@ def scene_video_prompt(scene: dict[str, Any], characters: list[dict[str, Any]]) 
 # MiniMax H3 full-reference (ref2video) prompt profile
 # ---------------------------------------------------------------------------
 # Condensed from MiniMax's VIDEO_PROMPT_WRITING_GUIDE_ref_en.md, adapted to
-# Calliope's single-scene clips: each subject's reference image is wired into
-# the workflow's generic (Input:image) slots in node-id order, and that order
-# defines the <Subject N> / <Picture N> numbering below.
+# Calliope's single-scene clips. Image slots are (Input:image) in node-id
+# order and that order is <Subject N> / <Picture N>. Video slots are
+# (Input:video) and become <Video N>. The files the user put in those slots
+# are the identity and motion source; story text only fills an empty slot.
 
 MINIMAX_H3_REF_SYSTEM = (
     "You rewrite scene descriptions into MiniMax H3's full-reference video prompt format. "
@@ -653,22 +669,26 @@ MINIMAX_H3_REF_SYSTEM = (
     "non_diegetic_music:\n"
     "\n"
     "Rules:\n"
-    "1. subject_definitions: one line per referenced subject supplied in the user message, "
+    "1. subject_definitions: one line per referenced image supplied in the user message, "
     "keeping its exact <Subject N> index. Form: '<Subject N> is the <description> in "
     "<Picture N>, with <the concrete features to preserve: face, hair, garments, accessories, "
     "palette>.' <Picture N> is the reference image wired to slot N — cite it inside the subject "
-    "line, never as a standalone entry. Never invent labels beyond the supplied subjects; a "
-    "label keeps one meaning in every section. Labels are ALWAYS written with their angle "
-    "brackets — <Subject 1>, <Picture 1> — in every section; bare 'Picture 1' or 'Subject 1' "
-    "is wrong.\n"
+    "line, never as a standalone entry. Never invent labels beyond the supplied subjects and "
+    "videos; a label keeps one meaning in every section. Labels are ALWAYS written with their "
+    "angle brackets — <Subject 1>, <Picture 1>, <Video 1> — in every section; bare 'Picture 1' "
+    "or 'Subject 1' is wrong.\n"
     "2. summary: one short English paragraph starting with '[reference generation]' that "
-    "states what happens using the <Subject N> labels.\n"
+    "states what happens using the <Subject N> labels. When a <Video N> is supplied, "
+    "say that its camera and physical performance drive the motion.\n"
     "3. retention_analysis: one line per subject, listing the shots it appears in and ONE of the "
     "model's fixed markers: fully_preserved | partially_preserved | attribute_transfer | "
     "weak_reference. Form: '<Subject N> (appears in [Shot 1], [Shot 2]): fully_preserved - "
     "<which defined features are retained>.' A character whose identity must hold is "
     "fully_preserved; a location seen from a new angle or under changed light is "
-    "partially_preserved. New actions, backgrounds or plot are not losses of fidelity.\n"
+    "partially_preserved. New actions, backgrounds or plot are not losses of fidelity. "
+    "One line per supplied <Video N>, with ONE of the same four markers and never any other "
+    "word: '<Video N> (camera movement and action timing): attribute_transfer - <the camera, "
+    "timing and physical action taken from the clip>.'\n"
     "4. detailed_description: the main body, 350–500 words. Open with one or two sentences of "
     "overall style (medium, lighting, palette, camera aesthetic) BEFORE '[Shot 1]'. Shot budget "
     "by scene duration: up to 6 s → 1–2 shots; 7–10 s → 2–3 shots; 11–15 s → 3–5 shots; each "
@@ -687,7 +707,8 @@ MINIMAX_H3_REF_SYSTEM = (
     "<Subject N> at its first visible appearance with its referenced features, position and "
     "action, then repeat its identity anchors (hair, garments, key props) in every later shot; "
     "keep screen direction and state changes (what got wet, opened, damaged) consistent across "
-    "cuts. Describe only what is visible, plus sound and dialogue.\n"
+    "cuts. When a reference video is supplied, state the camera move and the body action taken "
+    "from its frames. Describe only what is visible, plus sound and dialogue.\n"
     "5. Dialogue: give each speaker a stable ID in order of first speech — '<Subject N> (S1) "
     "says, <d>[English] …</d>'. A speaker with no defined subject uses a stable voice "
     "description, e.g. 'A narrator (S2) says, <d>[English] …</d>'. The identifying phrase, ID, "
@@ -704,6 +725,10 @@ MINIMAX_H3_REF_SYSTEM = (
     "silence. non_diegetic_music: one to three sentences of score the characters cannot hear — "
     "instrumentation, tempo, rhythm, dynamics, no mood words — or 'N/A'. Music the characters "
     "can hear (a radio, a live band) belongs in the shot description instead.\n"
+    "8. Reference videos: one subject_definitions line per <Video N> supplied in the "
+    "user message. Form: '<Video N> is the motion reference, with <camera and action "
+    "to preserve>.' Never drop a supplied video. Do not invent a <Video N> that was "
+    "not supplied.\n"
     "Write everything in English except dialogue/lyrics inside <d> and visible on-screen text."
 )
 
@@ -711,74 +736,154 @@ MINIMAX_H3_REF_SYSTEM = (
 def _subject_roster_lines(subjects: list[dict[str, Any]]) -> str:
     lines = []
     for s in subjects:
+        appearance = (s.get("appearance") or "").strip()
+        if not appearance:
+            appearance = (
+                f"no written description — describe Picture {s['index']} from the "
+                "attached image; do not substitute another character or location"
+            )
+        file_bit = ""
+        path = str(s.get("path") or "").strip()
+        if path:
+            file_bit = f", file {Path(path).name}"
         lines.append(
             f"<Subject {s['index']}> = {s['kind']} \"{s.get('name') or 'unnamed'}\" "
-            f"(reference image slot {s['index']}): {s.get('appearance') or 'no description'}"
+            f"(reference image slot {s['index']}{file_bit}): {appearance}"
+        )
+    return "\n".join(lines)
+
+
+def _video_roster_lines(videos: list[dict[str, Any]]) -> str:
+    lines = []
+    for v in videos:
+        name = v.get("name") or Path(str(v.get("path") or "")).name or "clip"
+        lines.append(
+            f"<Video {v['index']}> = motion reference \"{name}\" "
+            f"(reference video slot {v['index']}). Preserve its camera movement, "
+            "timing, and physical performance. Do not drop this label."
         )
     return "\n".join(lines)
 
 
 def build_minimax_h3_ref_messages(
-    scene: dict[str, Any], subjects: list[dict[str, Any]]
-) -> list[dict[str, str]]:
+    scene: dict[str, Any],
+    subjects: list[dict[str, Any]],
+    videos: list[dict[str, Any]] | None = None,
+    media_parts: list[dict[str, Any]] | None = None,
+    continuity: str | None = None,
+) -> list[dict[str, Any]]:
     """LLM messages that rewrite a scene into H3's six-section ref format.
 
-    subjects: ordered roster — index N corresponds to ref image slot N.
+    subjects: ordered image roster — index N is ref image slot N.
+    videos: ordered ``(Input:video)`` clips — index N is ``<Video N>``.
+    media_parts: optional vision parts (picture labels + image_url frames)
+    appended after the text so a vision model sees the actual files.
     """
+    videos = videos or []
     roster = _subject_roster_lines(subjects) or (
         "(no reference images — describe subjects from the action text)"
     )
+    video_roster = _video_roster_lines(videos) or "(no reference video)"
+    lock = (continuity or "").strip()
+    lock_block = ""
+    if lock:
+        lock_block = (
+            "\nContinuity ledger (binding — phrase these facts into the six "
+            "sections; do not recast a subject, move a dialogue line, or change "
+            "lighting or screen direction):\n"
+            f"{lock}\n"
+        )
     user = f"""Rewrite this scene into MiniMax H3 full-reference format.
 
+The reference images and videos below are what the user wired into this clip.
+They decide who is on screen and how the shot moves. The scene action decides
+what happens. When a picture or video frame disagrees with a story name, the
+file wins. Be specific about visible clothing, armor, weapons, face, hair, and colors.
+{lock_block}
 Scene heading: {scene.get('heading') or '(none)'}
 Scene duration: ~{scene.get('duration_sec') or 6} seconds
 
-Action (visual base for detailed_description):
+Action (what happens — not a replacement for the reference files):
 {scene.get('action') or '(none)'}
 
 Dialogue (raw 'SPEAKER: line' format; optional '(delivery cue)' after the speaker —
 map speakers to subjects by name and keep cues as delivery direction):
 {scene.get('dialog') or '(none)'}
 
-Referenced subjects (keep these exact indices):
+Referenced images (keep these exact <Subject N> indices; Picture N is image N):
 {roster}
+
+Referenced videos (keep these exact <Video N> labels):
+{video_roster}
 """
+    content: str | list[dict[str, Any]] = user
+    if media_parts:
+        content = [{"type": "text", "text": user}, *media_parts]
     return [
         {"role": "system", "content": MINIMAX_H3_REF_SYSTEM},
-        {"role": "user", "content": user},
+        {"role": "user", "content": content},
     ]
 
 
-def minimax_h3_ref_fallback(scene: dict[str, Any], subjects: list[dict[str, Any]]) -> str:
+def minimax_h3_ref_fallback(
+    scene: dict[str, Any],
+    subjects: list[dict[str, Any]],
+    videos: list[dict[str, Any]] | None = None,
+) -> str:
     """Deterministic six-section H3 prompt — used when the LLM rewrite fails."""
+    videos = videos or []
     defs = []
     retention = []
     for s in subjects:
         name = s.get("name") or "unnamed"
         desc = (s.get("appearance") or "").strip()
-        defs.append(
-            f"<Subject {s['index']}> is the {s['kind']} \"{name}\" in "
-            f"<Picture {s['index']}>" + (f", {desc}." if desc else ".")
-        )
+        if desc:
+            defs.append(
+                f"<Subject {s['index']}> is the {s['kind']} \"{name}\" in "
+                f"<Picture {s['index']}>, {desc}."
+            )
+        else:
+            defs.append(
+                f"<Subject {s['index']}> is the reference image in "
+                f"<Picture {s['index']}> (\"{name}\"). Preserve its visible identity, "
+                "wardrobe, proportions, and materials."
+            )
         retention.append(
             f"<Subject {s['index']}> (appears in [Shot 1]): fully_preserved - "
             f"the referenced appearance of \"{name}\" is retained."
+        )
+    for v in videos:
+        name = v.get("name") or "clip"
+        defs.append(
+            f"<Video {v['index']}> is the motion reference \"{name}\". "
+            "Preserve its camera movement, action timing, and physical performance."
+        )
+        retention.append(
+            f"<Video {v['index']}> (motion across [Shot 1]): motion_preserved - "
+            "camera path, timing, and physical performance from the reference video "
+            "are retained."
         )
 
     heading = (scene.get("heading") or "").strip()
     action = (scene.get("action") or "").strip()
     labels = ", ".join(f"<Subject {s['index']}>" for s in subjects)
-    summary = (
-        f"[reference generation] {heading or 'A scene'} featuring {labels}."
-        if labels
-        else f"[reference generation] {heading or 'A scene'}."
-    )
+    video_labels = ", ".join(f"<Video {v['index']}>" for v in videos)
+    if labels:
+        summary = f"[reference generation] {heading or 'A scene'} featuring {labels}."
+    else:
+        summary = f"[reference generation] {heading or 'A scene'}."
+    if video_labels:
+        summary += f" Motion and camera follow {video_labels}."
 
     body = (
         "The target video is in a cinematic style consistent with the reference images, "
         "with coherent lighting and natural motion.\n"
         f"[Shot 1] {heading} {action}".strip()
     )
+    if video_labels:
+        body += (
+            f"\nThe physical performance, camera path, and timing follow {video_labels}."
+        )
 
     # Map 'SPEAKER: line' rows onto subjects by name; assign speaker IDs in speech order.
     # An optional delivery cue — 'MIA (whispering): line' — is kept as performance direction.
