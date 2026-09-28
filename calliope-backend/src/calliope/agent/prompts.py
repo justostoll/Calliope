@@ -632,6 +632,32 @@ def item_image_prompt(item: dict[str, Any]) -> str:
     return item_reference_prompt(item)
 
 
+def video_setting(location: dict[str, Any] | None) -> dict[str, str] | None:
+    """The scene's environment for VIDEO prompts ({name, description}) or None.
+
+    Uses the location's description, not its consistency_prompt (an
+    image-generation prompt that says "no people" — wrong for a clip).
+    """
+    if not location:
+        return None
+    name = (location.get("name") or "").strip()
+    description = (location.get("description") or "").strip()
+    if not name and not description:
+        return None
+    return {"name": name or "the location", "description": description}
+
+
+def _setting_sentence(setting: dict[str, str] | None) -> str:
+    if not setting:
+        return ""
+    desc = setting["description"].rstrip(".")
+    return (
+        f"The scene takes place in {setting['name']}: {desc}."
+        if desc
+        else f"The scene takes place in {setting['name']}."
+    )
+
+
 def scene_video_prompt(scene: dict[str, Any], characters: list[dict[str, Any]]) -> str:
     char_bits = ", ".join(
         f"{c.get('name')}: {c.get('consistency_prompt') or c.get('appearance') or ''}"
@@ -733,6 +759,10 @@ MINIMAX_H3_REF_SYSTEM = (
     "user message. Form: '<Video N> is the motion reference, with <camera and action "
     "to preserve>.' Never drop a supplied video. Do not invent a <Video N> that was "
     "not supplied.\n"
+    "9. Setting: when the user message gives a Setting, the style opener and [Shot 1] must "
+    "establish that environment (space, key features, lighting, time of day) and every "
+    "later shot stays in it — whether or not the setting has its own reference image. "
+    "The overall_soundscape follows that environment.\n"
     "Write everything in English except dialogue/lyrics inside <d> and visible on-screen text."
 )
 
@@ -769,12 +799,20 @@ def _video_roster_lines(videos: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _setting_block(setting: dict[str, str] | None) -> str:
+    if not setting:
+        return "(none given — infer the environment from the heading)"
+    return f"{setting['name']} — {setting['description'] or 'no description'}"
+
+
 def build_minimax_h3_ref_messages(
     scene: dict[str, Any],
     subjects: list[dict[str, Any]],
     videos: list[dict[str, Any]] | None = None,
     media_parts: list[dict[str, Any]] | None = None,
     continuity: str | None = None,
+    *,
+    setting: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """LLM messages that rewrite a scene into H3's six-section ref format.
 
@@ -782,6 +820,9 @@ def build_minimax_h3_ref_messages(
     videos: ordered ``(Input:video)`` clips — index N is ``<Video N>``.
     media_parts: optional vision parts (picture labels + image_url frames)
     appended after the text so a vision model sees the actual files.
+    setting: the scene's environment, ALWAYS passed in text — the location only
+    becomes a <Subject N> when a ref slot is left for its image, and without
+    this the environment silently vanished from 1-slot workflows.
     """
     videos = videos or []
     roster = _subject_roster_lines(subjects) or (
@@ -806,6 +847,9 @@ file wins. Be specific about visible clothing, armor, weapons, face, hair, and c
 {lock_block}
 Scene heading: {scene.get('heading') or '(none)'}
 Scene duration: ~{scene.get('duration_sec') or 6} seconds
+
+Setting (the environment of every shot — establish it in the style opener and [Shot 1]):
+{_setting_block(setting)}
 
 Action (what happens — not a replacement for the reference files):
 {scene.get('action') or '(none)'}
@@ -833,8 +877,14 @@ def minimax_h3_ref_fallback(
     scene: dict[str, Any],
     subjects: list[dict[str, Any]],
     videos: list[dict[str, Any]] | None = None,
+    *,
+    setting: dict[str, str] | None = None,
 ) -> str:
-    """Deterministic six-section H3 prompt — used when the LLM rewrite fails."""
+    """Deterministic six-section H3 prompt — used when the LLM rewrite fails.
+
+    ``setting`` puts the environment in the summary, [Shot 1] and the
+    soundscape. Without one the output is unchanged.
+    """
     videos = videos or []
     defs = []
     retention = []
@@ -872,17 +922,25 @@ def minimax_h3_ref_fallback(
     action = (scene.get("action") or "").strip()
     labels = ", ".join(f"<Subject {s['index']}>" for s in subjects)
     video_labels = ", ".join(f"<Video {v['index']}>" for v in videos)
+    where = f", set in {setting['name']}" if setting else ""
     if labels:
-        summary = f"[reference generation] {heading or 'A scene'} featuring {labels}."
+        summary = (
+            f"[reference generation] {heading or 'A scene'}{where}"
+            f"{',' if where else ''} featuring {labels}."
+        )
     else:
-        summary = f"[reference generation] {heading or 'A scene'}."
+        summary = f"[reference generation] {heading or 'A scene'}{where}."
     if video_labels:
         summary += f" Motion and camera follow {video_labels}."
 
+    if setting:
+        shot = " ".join(p for p in (heading, _setting_sentence(setting), action) if p)
+    else:
+        shot = f"{heading} {action}"
     body = (
         "The target video is in a cinematic style consistent with the reference images, "
         "with coherent lighting and natural motion.\n"
-        f"[Shot 1] {heading} {action}".strip()
+        f"[Shot 1] {shot}".strip()
     )
     if video_labels:
         body += (
@@ -919,6 +977,12 @@ def minimax_h3_ref_fallback(
         "summary:\n" + summary + "\n\n"
         "retention_analysis:\n" + ("\n".join(retention) if retention else "N/A") + "\n\n"
         "detailed_description:\n" + body + "\n\n"
-        "overall_soundscape:\nN/A\n\n"
+        "overall_soundscape:\n" + _soundscape_fallback(setting) + "\n\n"
         "non_diegetic_music:\nN/A"
     )
+
+
+def _soundscape_fallback(setting: dict[str, str] | None) -> str:
+    if not setting:
+        return "N/A"
+    return f"Natural ambience of {setting['name']} continues throughout the clip."

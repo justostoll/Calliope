@@ -24,6 +24,7 @@ from calliope.agent.prompts import (
     build_minimax_h3_ref_messages,
     minimax_h3_ref_fallback,
     scene_video_prompt,
+    video_setting,
 )
 from calliope.comfyui.parser import parse_dynamic_inputs
 from calliope.comfyui.roles import input_has_role
@@ -81,12 +82,14 @@ def _story_image_roster(
             }
         )
     if loc_image:
-        loc = location or {}
+        # The description, not consistency_prompt: that is the environment
+        # reference's image prompt ("no people") and wrong for a clip.
+        setting = video_setting(location) or {"name": "the location", "description": ""}
         roster.append(
             {
                 "kind": "location",
-                "name": loc.get("name"),
-                "appearance": loc.get("consistency_prompt") or loc.get("description") or "",
+                "name": setting["name"],
+                "appearance": setting["description"],
                 "path": loc_image,
             }
         )
@@ -218,9 +221,13 @@ async def _h3_rewrite(
     *,
     videos: list[dict[str, Any]] | None = None,
     continuity: str | None = None,
+    setting: dict[str, str] | None = None,
     timeout: float = 120.0,
 ) -> str:
     """LLM rewrite into H3's six-section format, deterministic template on failure.
+
+    ``setting`` (the location's text) is passed whether or not the location
+    got an image slot — a 1-slot workflow used to lose the environment.
 
     The timeout bounds the whole wait for a dead endpoint before the template
     kicks in — the preview path passes a short value so the UI fails fast.
@@ -238,13 +245,14 @@ async def _h3_rewrite(
                 videos=videos,
                 media_parts=media_parts or None,
                 continuity=continuity,
+                setting=setting,
             ),
             temperature=0.4,
             extra_body=settings.h3_rewrite_extra_body or None,
         )
     except Exception as exc:
         logger.warning("MiniMax H3 prompt rewrite failed (%s); using fallback template", exc)
-        return minimax_h3_ref_fallback(scene, subjects, videos)
+        return minimax_h3_ref_fallback(scene, subjects, videos, setting=setting)
     finally:
         await client.close()
 
@@ -540,7 +548,12 @@ async def preview_clip_prompt(
             # Preview is interactive — fail fast to the deterministic template
             # instead of making the user wait out a dead endpoint.
             prompt = await _h3_rewrite(
-                scene, subjects, videos=videos, continuity=lock, timeout=30.0
+                scene,
+                subjects,
+                videos=videos,
+                continuity=lock,
+                setting=video_setting(loc_row),
+                timeout=30.0,
             )
         critic = await _critique_or_unavailable(prompt, plan, clip_id)
         # A dead or unreadable judge leaves this prompt in place and reports
@@ -740,7 +753,11 @@ async def enqueue_video_jobs(
                         },
                     )
                     prompt = await _h3_rewrite(
-                        scene, subjects, videos=videos, continuity=lock
+                        scene,
+                        subjects,
+                        videos=videos,
+                        continuity=lock,
+                        setting=video_setting(loc_row),
                     )
                 values = smart_fill_inputs(
                     inputs,
