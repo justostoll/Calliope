@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from calliope.agent.harness.policy import is_render_request
+from calliope.agent.harness.policy import _COMPOUND_SPLIT_RE, is_render_request
 
 
 @pytest.mark.parametrize(
@@ -52,3 +52,39 @@ from calliope.agent.harness.policy import is_render_request
 )
 def test_render_intent(text: str, want: bool):
     assert is_render_request(text) is want, text
+
+
+# The compound splitter split "to" between ANY two letters: "storyboard" became
+# "s ryboard" (the cue could never match) and "stop" became "s p" (the negation
+# vanished, so "stop rendering" read as a render request).
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("turn scene 3 into a storyboard", True),
+        ("storyboard the opening", True),
+        ("make a storyboard", True),
+        ("generate storyboards for all scenes", True),
+        ("stop rendering", False),
+        ("please stop generating the videos", False),
+        ("stop generating images", False),
+        # the storyboard cue obeys negation like every other cue
+        ("don't make a storyboard", False),
+        ("no storyboard, just the script", False),
+        # "stop motion" is an animation style, not a stop
+        ("make a stop-motion clip of scene 2", True),
+        ("stop motion video for the opening", True),
+        # "to" / "2" still join a compound before a media noun
+        ("textToImage for the poster", True),
+        ("ref2image for Ana", True),
+    ],
+)
+def test_compound_splitter_keeps_plain_words(text: str, want: bool):
+    assert is_render_request(text) is want, text
+
+
+def test_compound_splitter_splits_only_compounds():
+    for word in ("storyboard", "stop", "custom", "history", "photos"):
+        assert _COMPOUND_SPLIT_RE.sub(" ", word) == word
+    assert _COMPOUND_SPLIT_RE.sub(" ", "text2video") == "text video"
+    assert _COMPOUND_SPLIT_RE.sub(" ", "textToImage") == "text Image"
+    assert _COMPOUND_SPLIT_RE.sub(" ", "image-to-video") == "image to video"

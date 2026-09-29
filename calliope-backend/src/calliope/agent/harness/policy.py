@@ -33,8 +33,9 @@ _CONFIRM_RE = re.compile(
     r"that'?s\s+fine)\b",
     re.IGNORECASE,
 )
+# "stop motion" / "stop-motion" is an animation style, not a stop.
 _NEGATE_RE = re.compile(
-    r"\b(no|not|don'?t|do\s+not|cancel|stop|never|abort|skip|hold\s+on|wait)\b",
+    r"\b(no|not|don'?t|do\s+not|cancel|stop(?![\s-]*motion)|never|abort|skip|hold\s+on|wait)\b",
     re.IGNORECASE,
 )
 
@@ -53,7 +54,13 @@ _RENDER_REQUEST_RE = re.compile(
 )
 
 # Compound splitter: "text2video" → "text video" so the bare token matches.
-_COMPOUND_SPLIT_RE = re.compile(r"(?<=[a-z])(?:2|to|-)(?=[a-z])", re.IGNORECASE)
+# "to" joins only before a media noun ("textToImage"): letter-to-letter also
+# sits inside plain words, and splitting it made "storyboard" "s ryboard"
+# (the cue never matched) and "stop rendering" "s p rendering" (the
+# negation vanished and the message read as a render request).
+_COMPOUND_SPLIT_RE = re.compile(
+    r"(?<=[a-z])(?:2|-|to(?=video|vid|image|img|photo))(?=[a-z])", re.IGNORECASE
+)
 
 _APPENDIX_MARK = "[Calliope context]"
 
