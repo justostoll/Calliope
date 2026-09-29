@@ -26,7 +26,9 @@ def register(registry: ToolRegistry) -> None:
                 "when you need current ids/counts. On a LARGE project the full "
                 "result gets truncated — pass sections (e.g. "
                 "[\"characters\",\"locations\",\"items\"]) to fetch only what "
-                "you need; project + stats are always included."
+                "you need, and page long lists with offset/limit (e.g. "
+                "sections=[\"beats\"], offset=0, limit=10, then offset=10); "
+                "project + stats are always included."
             ),
             parameters={
                 "type": "object",
@@ -47,7 +49,24 @@ def register(registry: ToolRegistry) -> None:
                             "Which sections to include. Omit for all — but on "
                             "large projects prefer only the sections you need."
                         ),
-                    }
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Skip this many rows of each returned list (beats "
+                            "and scenes in story order). Default 0."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Return at most this many rows of each list. The "
+                            "reply's page.totals give full counts and "
+                            "page.next_offset where to continue."
+                        ),
+                    },
                 },
             },
             executor=t_get_workspace,
@@ -170,6 +189,20 @@ def register(registry: ToolRegistry) -> None:
 _WS_SECTIONS = ("beats", "characters", "locations", "items", "scenes")
 
 
+def _page_args(args: dict[str, Any]) -> tuple[int, int | None] | str:
+    """(offset, limit) from get_workspace args, or an error string."""
+    try:
+        offset = int(args.get("offset") or 0)
+        limit = None if args.get("limit") is None else int(args["limit"])
+    except (TypeError, ValueError):
+        return f"offset/limit must be integers, got {args.get('offset')!r}/{args.get('limit')!r}"
+    if offset < 0:
+        return f"offset must be >= 0, got {offset}"
+    if limit is not None and limit < 1:
+        return f"limit must be >= 1, got {limit}"
+    return offset, limit
+
+
 # ── executors ───────────────────────────────────────────────────
 
 
@@ -207,6 +240,10 @@ async def t_get_workspace(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
                 }
         else:
             wanted = set(_WS_SECTIONS)
+        page_args = _page_args(args)
+        if isinstance(page_args, str):
+            return {"ok": False, "error": page_args}
+        offset, limit = page_args
         beats = [
             row_to_dict(r)
             for r in conn.execute(
@@ -250,6 +287,8 @@ async def t_get_workspace(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
         out["mode"] = "linked"
         out["project"] = project
         out["stats"] = _project_stats(ctx.project_id, conn)
+        paged = offset > 0 or limit is not None
+        totals: dict[str, int] = {}
         for key, value in (
             ("beats", beats),
             ("characters", characters),
@@ -258,7 +297,16 @@ async def t_get_workspace(ctx: ToolContext, args: dict[str, Any]) -> dict[str, A
             ("scenes", scenes),
         ):
             if value is not None:
+                if paged:
+                    totals[key] = len(value)
+                    end = offset + limit if limit is not None else None
+                    value = value[offset:end]
                 out[key] = value
+        if paged:
+            page: dict[str, Any] = {"offset": offset, "limit": limit, "totals": totals}
+            if limit is not None and any(n > offset + limit for n in totals.values()):
+                page["next_offset"] = offset + limit
+            out["page"] = page
         if len(wanted) < len(_WS_SECTIONS):
             out["sections_omitted"] = sorted(set(_WS_SECTIONS) - wanted)
         return out

@@ -55,7 +55,11 @@ MEMORY_FORGOTTEN = "memory/forgotten"
 # permissions. Loops drain these between steps and inject them as context.
 STEERING_MESSAGE = "steering/message"
 
-TOOL_RESULT_TRUNCATE = 4000
+# ~4k tokens. At 4,000 a 3-minute film's beats section alone (15 beats, 6.1k
+# chars) was cut at beat 11 and no smaller slice existed, so the agent deleted
+# beats to make the rest fit (observed live 2026-09-29). 16k holds that story
+# whole; get_workspace offset/limit pages anything longer.
+TOOL_RESULT_TRUNCATE = 16000
 # Appended wherever a tool result is cut for the LLM. Must TEACH the way out —
 # a bare "[truncated]" sends agents into retry loops hoping for a different
 # cut (observed live 2026-08-24: an assets sub-agent re-called get_workspace
@@ -63,8 +67,10 @@ TOOL_RESULT_TRUNCATE = 4000
 TRUNCATE_NOTE = (
     "…[truncated — the full result is too large for one reply. Fetch a "
     "smaller slice instead of retrying: get_workspace accepts "
-    "sections=[\"characters\",\"locations\",\"items\",\"beats\",\"scenes\"], "
-    "and scoped tools (get_story, list_scenes) return less.]"
+    "sections=[\"characters\",\"locations\",\"items\",\"beats\",\"scenes\"] "
+    "and pages long lists with offset/limit (e.g. sections=[\"beats\"], "
+    "offset=10, limit=10; page.next_offset says where to continue). Never "
+    "delete or edit content to make a result fit.]"
 )
 
 # Cap for ANY single event payload at append time: keeps the append-only log

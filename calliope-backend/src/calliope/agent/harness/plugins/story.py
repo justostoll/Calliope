@@ -44,7 +44,8 @@ def register(registry: ToolRegistry) -> None:
             description=(
                 "Read the linked project's story: project row, beats, characters, "
                 "locations, items with real ids — the source of truth for character_id / "
-                "location_id / item_id arguments."
+                "location_id / item_id arguments. Returns everything at once; on a "
+                "long project page it with get_workspace(sections, offset, limit)."
             ),
             parameters={"type": "object", "properties": {}},
             executor=t_get_story,
