@@ -766,10 +766,28 @@ async def t_list_clips(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]
         conn.close()
 
 
+def _scenes_broken_since_user_message(session_id: int) -> set[int]:
+    """Scene ids break_into_shots already expanded since the user's latest
+    message (refused calls broke nothing and do not count)."""
+    from calliope.agent.harness import log as session_log
+
+    done: set[int] = set()
+    for ev in session_log.read_events(session_id):
+        if ev.type == session_log.USER_MESSAGE:
+            done = set()
+        elif ev.type == session_log.TOOL_RESULT and ev.data.get("tool_name") == "break_into_shots":
+            result = ev.data.get("result")
+            if isinstance(result, dict) and result.get("ok"):
+                for s in result.get("scenes") or []:
+                    if isinstance(s, dict) and s.get("scene_id") is not None:
+                        done.add(int(s["scene_id"]))
+    return done
+
+
 async def t_break_into_shots(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     from calliope.agent.coverage_agent import expand_scene_coverage
     from calliope.agent.harness import log as session_log
-    from calliope.agent.harness.policy import allows_bulk_video_enqueue
+    from calliope.agent.harness.policy import allows_bulk_video_enqueue, named_scene_orders
 
     scene_ids = [int(i) for i in (args.get("scene_ids") or [])]
     orders = [int(i) for i in (args.get("orders") or [])]
@@ -814,14 +832,37 @@ async def t_break_into_shots(ctx: ToolContext, args: dict[str, Any]) -> dict[str
         return {"ok": False, "error": "No matching scenes to expand"}
 
     latest = session_log.latest_user_message(ctx.session_id) or ""
-    if len(resolved) > 3 and not allows_bulk_video_enqueue(latest, len(resolved)):
-        return {
-            "ok": False,
-            "error": (
-                f"Breaking {len(resolved)} scenes is a bulk pass (~{len(resolved) * 5}+ "
-                "clips). Confirm the user asked for every scene, or name the ones they want."
-            ),
-        }
+    # The cap covers everything broken on this user message, not one call:
+    # per call, 3 + 3 + … scenes passed unasked (observed live 2026-09-29).
+    batch = _scenes_broken_since_user_message(ctx.session_id) | set(resolved)
+    if len(batch) > 3 and not allows_bulk_video_enqueue(latest, len(batch)):
+        named = named_scene_orders(latest)
+        conn = _db()
+        try:
+            orders = {
+                int(r["order_index"])
+                for r in conn.execute(
+                    f"SELECT order_index FROM scenes WHERE id IN ({','.join('?' * len(batch))})",
+                    tuple(batch),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        if not named or not orders <= named:
+            already = len(batch) - len(set(resolved))
+            counted = (
+                f", counting {already} already broken since the user's last message"
+                if already
+                else ""
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"Breaking {len(batch)} scenes is a bulk pass (~{len(batch) * 5}+ clips)"
+                    f"{counted}. Do not split it into smaller batches. Ask the user: they can say "
+                    "'break all remaining scenes into shots' or name the scenes ('scenes 7–15')."
+                ),
+            }
 
     try:
         result = await expand_scene_coverage(

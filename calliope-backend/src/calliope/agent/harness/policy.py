@@ -151,6 +151,32 @@ def allows_bulk_video_enqueue(text: str, count: int) -> bool:
     return allows_bulk_enqueue(text, count)
 
 
+# "scenes 7–15", "scene 4", "scenes 2, 5 and 9": numbers the user named are
+# scene ORDERS (the numbers the UI shows), not ids.
+_SCENE_REF_RE = re.compile(
+    r"\bscenes?\s+(?:#\s*)?(\d+(?:\s*(?:-|–|—|to|through|thru|and|,|&)\s*\d+)*)",
+    re.IGNORECASE,
+)
+_SCENE_RANGE_RE = re.compile(r"(\d+)\s*(?:-|–|—|to|through|thru)\s*(\d+)", re.IGNORECASE)
+
+
+def named_scene_orders(text: str) -> set[int]:
+    """Scene numbers the user named in their own words; a negated mention
+    ("not scenes 7–9") names nothing."""
+    t = user_prose(text)
+    out: set[int] = set()
+    for m in _SCENE_REF_RE.finditer(t):
+        if _cue_is_negated(t[max(0, m.start() - 60) : m.start()], t[m.end() : m.end() + 30]):
+            continue
+        chunk = m.group(1)
+        for a, b in _SCENE_RANGE_RE.findall(chunk):
+            lo, hi = sorted((int(a), int(b)))
+            if hi - lo <= 500:
+                out.update(range(lo, hi + 1))
+        out.update(int(n) for n in re.findall(r"\d+", _SCENE_RANGE_RE.sub(" ", chunk)))
+    return out
+
+
 def user_allows_render(ctx: ToolContext) -> bool:
     """Render permission from explicit user acts only (see module docstring).
 
