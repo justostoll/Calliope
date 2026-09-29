@@ -152,7 +152,14 @@ def allows_bulk_video_enqueue(text: str, count: int) -> bool:
 
 
 def user_allows_render(ctx: ToolContext) -> bool:
-    """Render permission from explicit user acts only (see module docstring)."""
+    """Render permission from explicit user acts only (see module docstring).
+
+    A bare confirmation counts only when the user typed it: a card click is
+    also a user/message, and "Yes" / "Yes, replace it" on an info or
+    destructive_replace card answers THAT question, not "render?" (a
+    render-scoped card grants through has_structured_approval). A clicked
+    option whose own words ask for images/video still counts, like a clicked
+    option naming the command in user_allows_shell."""
     if has_structured_approval(ctx, "render"):
         return True
     from calliope.agent.harness import log as session_log
@@ -160,7 +167,9 @@ def user_allows_render(ctx: ToolContext) -> bool:
     if session_log.latest_user_has_workflow_tag(ctx.session_id):
         return True
     latest = session_log.latest_user_message(ctx.session_id) or ""
-    return is_render_request(latest) or is_confirmation(latest)
+    if is_render_request(latest):
+        return True
+    return latest_answer(ctx.session_id) is None and is_confirmation(latest)
 
 
 # ── Shell permission (run_command) ────────────────────────────────────────
