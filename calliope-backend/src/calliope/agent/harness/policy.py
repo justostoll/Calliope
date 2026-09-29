@@ -124,11 +124,17 @@ def is_render_request(text: str) -> bool:
 # More than this many targets needs an explicit "all / every / remaining"
 # word in the user's prose, or explicit ids in the tool args. A bare "yes"
 # after a 2-item offer must not enqueue the whole project (the model has
-# dumped every id before).
+# dumped every id before). A number in the ask caps it ("all 8 clips" covers
+# 8 targets, not 24), and a negated ask ("not all scenes, just 4 and 5") asks
+# for nothing — clause-scoped, like every other cue here.
 BULK_ENQUEUE_LIMIT = 3
+_BULK_NOUN = r"(?:scenes?|clips?|videos?|shots?|assets?|images?|characters?|locations?|items?)"
 _BULK_RE = re.compile(
     r"\b("
-    r"all(\s+the)?\s+(scenes?|clips?|videos?|shots?|assets?|images?|characters?|locations?|items?)"
+    # "all scenes", "all the clips", "all 8 H3 clips", "all the remaining shots"
+    rf"all(?:\s+the)?(?:\s+(?P<n>\d+)|\s+remaining|\s+other)?(?:\s+[\w-]+)?\s+{_BULK_NOUN}"
+    r"|all\s+(?P<n_bare>\d+)"
+    r"|all\s+of\s+(?:them|these|those)"
     r"|every\s+(scene|clip|shot|asset|image|character|location|item)"
     r"|entire\s+(film|project|script|timeline|cast)"
     r"|whole\s+(film|project|script|cast)"
@@ -140,10 +146,20 @@ _BULK_RE = re.compile(
 
 
 def allows_bulk_enqueue(text: str, count: int) -> bool:
-    """True when `count` targets is a small batch, or the user asked for all."""
+    """True when `count` targets is a small batch, or the user asked for all
+    of them (and any number they gave covers `count`)."""
     if count <= BULK_ENQUEUE_LIMIT:
         return True
-    return bool(_BULK_RE.search(user_prose(text)))
+    t = user_prose(text)
+    for clause in re.split(r"[,.;!?]|\bbut\b|\bhowever\b", t, flags=re.IGNORECASE):
+        for m in _BULK_RE.finditer(clause):
+            if _cue_is_negated(clause[: m.start()], clause[m.end() :]):
+                continue
+            n = m.group("n") or m.group("n_bare")
+            if n is not None and int(n) < count:
+                continue
+            return True
+    return False
 
 
 # Back-compat alias used by the video path.
@@ -177,15 +193,38 @@ def named_scene_orders(text: str) -> set[int]:
     return out
 
 
+# The plain-yes subset of _CONFIRM_RE. Its command verbs (regenerate,
+# replace, delete, rewrite …) confirm THAT command, not a render: in chat 169
+# (2026-09-29) a typed "Regenerate the full script …" unlocked the render
+# tools through is_confirmation.
+_AFFIRM_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|k|confirm(?:ed)?|proceed|go\s+ahead|do\s+it|"
+    r"please\s+do|go\s+for\s+it|fine|sounds\s+good|that'?s\s+fine)\b",
+    re.IGNORECASE,
+)
+
+
+def is_affirmation(text: str) -> bool:
+    """True when a clause of the message is a plain, un-negated yes / ok /
+    go ahead — is_confirmation without the command verbs."""
+    t = user_prose(text)
+    for clause in re.split(r"[,.;!?]|\bbut\b|\bhowever\b", t, flags=re.IGNORECASE):
+        m = _AFFIRM_RE.search(clause)
+        if m and not _cue_is_negated(clause[: m.start()], clause[m.end() :]):
+            return True
+    return False
+
+
 def user_allows_render(ctx: ToolContext) -> bool:
     """Render permission from explicit user acts only (see module docstring).
 
-    A bare confirmation counts only when the user typed it: a card click is
+    A bare yes counts only when the user typed it: a card click is
     also a user/message, and "Yes" / "Yes, replace it" on an info or
     destructive_replace card answers THAT question, not "render?" (a
-    render-scoped card grants through has_structured_approval). A clicked
-    option whose own words ask for images/video still counts, like a clicked
-    option naming the command in user_allows_shell."""
+    render-scoped card grants through has_structured_approval). A typed
+    command verb ("regenerate the script") is not a yes to rendering either.
+    A clicked option whose own words ask for images/video still counts, like a
+    clicked option naming the command in user_allows_shell."""
     if has_structured_approval(ctx, "render"):
         return True
     from calliope.agent.harness import log as session_log
@@ -195,7 +234,7 @@ def user_allows_render(ctx: ToolContext) -> bool:
     latest = session_log.latest_user_message(ctx.session_id) or ""
     if is_render_request(latest):
         return True
-    return latest_answer(ctx.session_id) is None and is_confirmation(latest)
+    return latest_answer(ctx.session_id) is None and is_affirmation(latest)
 
 
 # ── Shell permission (run_command) ────────────────────────────────────────
