@@ -94,16 +94,21 @@ def _latest_user_message_mark(session_id: int) -> tuple[int, str | None] | None:
 
 
 def _rows_confirmed(
-    ctx: ToolContext, tables: tuple[str, ...], row_id: int | None = None
+    ctx: ToolContext,
+    tables: tuple[str, ...],
+    row_id: int | None = None,
+    *,
+    any_age: bool = False,
 ) -> int:
     """Rows of `tables` in the project that already existed when the user sent
     their latest message — the only content a confirmation in it can cover.
     One confirmation therefore buys one replacement: afterwards everything is
     newer than the message. Same-second rows count as existing (an agent's
-    content is always an LLM step newer); NULL created_at counts as existing."""
+    content is always an LLM step newer); NULL created_at counts as existing.
+    any_age=True counts every row, whatever its age."""
     from calliope.agent.harness.registry import _db
 
-    mark = _latest_user_message_mark(ctx.session_id)
+    mark = None if any_age else _latest_user_message_mark(ctx.session_id)
     since = mark[1] if mark else None
     conn = _db()
     try:
@@ -166,11 +171,16 @@ WIPE_MAX_CHARS = 40
 WIPE_KEEP_RATIO = 0.25
 
 # What each replace tool deletes (generate_story: routers/story.py;
-# generate_script: script_agent.py). Other replace tools: all content tables.
+# generate_script: script_agent.py) — the rows a confirmation must cover.
+# Other replace tools: all content tables.
 REPLACE_TOOL_TABLES = {
     "generate_story": ("story_beats", "characters", "locations", "items"),
     "generate_script": ("scenes",),
 }
+# What gates a replace tool at all. A new story orphans an existing script,
+# so generate_story is gated by any content; generate_script only by scenes —
+# the story is its input, not what it replaces.
+GUARDED_TABLES = {"generate_script": ("scenes",)}
 _CONTENT_TABLES = ("scenes", "story_beats", "characters", "locations", "items")
 
 
@@ -331,24 +341,32 @@ def _destructive_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> PreEx
     has_content = (scenes + beats + chars + locs + items) > 0
     if not has_content:
         return allow()
-    confirmed = _user_confirmed_replacement(ctx)
-    if confirmed and _rows_confirmed(ctx, REPLACE_TOOL_TABLES.get(t.name, _CONTENT_TABLES)):
+    # The first generate_script on a drafted story replaces nothing, so it is
+    # not gated; 12ca9c0 refused it even after a yes (observed live
+    # 2026-09-29) because it gated on beats and then found no covered scene.
+    if not _rows_confirmed(ctx, GUARDED_TABLES.get(t.name, _CONTENT_TABLES), any_age=True):
         return allow()
+    confirmed = _user_confirmed_replacement(ctx)
     counts = (
         f"Project #{ctx.project_id} already has content ({scenes} scenes, {beats} beats, "
         f"{chars} characters, {locs} locations, {items} items)."
     )
-    if confirmed:
-        return deny(
-            counts + f" Everything {t.name} would replace was created AFTER the "
-            "user's last message, so the user has not seen it and their earlier "
-            "yes does not cover it (one confirmation covers one replacement). "
-            "Show them what is there now and ask again with "
-            "ask_user(scope=\"destructive_replace\"); for targeted changes use "
-            "the granular tools (add/update/delete) instead.",
-            code=GUARD_DESTRUCTIVE_REPLACE,
-        )
     if replace:
+        deleted = REPLACE_TOOL_TABLES.get(t.name, _CONTENT_TABLES)
+        if confirmed and (
+            not _rows_confirmed(ctx, deleted, any_age=True) or _rows_confirmed(ctx, deleted)
+        ):
+            return allow()
+        if confirmed:
+            return deny(
+                counts + f" Everything {t.name} would replace was created AFTER the "
+                "user's last message, so the user has not seen it and their earlier "
+                "yes does not cover it (one confirmation covers one replacement). "
+                "Show them what is there now and ask again with "
+                "ask_user(scope=\"destructive_replace\"); for targeted changes use "
+                "the granular tools (add/update/delete) instead.",
+                code=GUARD_DESTRUCTIVE_REPLACE,
+            )
         return deny(
             counts + " replace=true DELETES all of it first, and the user's "
             "latest message did not ask for a replacement. Ask them once "
@@ -360,6 +378,8 @@ def _destructive_guard(ctx: ToolContext, t: ToolDefinition, args: dict) -> PreEx
             "(add/update/delete) instead.",
             code=GUARD_DESTRUCTIVE_REPLACE,
         )
+    if confirmed:
+        return allow()
     return deny(
         counts + " replace=false would APPEND a second full set alongside "
         "the existing content (e.g. doubling the beat list). Ask the user "

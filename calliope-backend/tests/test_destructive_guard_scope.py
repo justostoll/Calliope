@@ -40,6 +40,7 @@ def _registry() -> ToolRegistry:
     reg = ToolRegistry()
     for name, props, destructive in (
         ("generate_story", {"replace": {"type": "boolean"}}, True),
+        ("generate_script", {"replace": {"type": "boolean"}}, True),
         ("delete_beat", {"beat_id": {"type": "integer"}}, True),
         (
             "update_beat",
@@ -231,3 +232,61 @@ def test_update_beat_wipe_allowed_after_confirmation_of_seen_beat(client):
     pid, ids = _project(client, T_AFTER)
     ctx = _session(pid, "yes, replace it")
     assert _blocked(_run(ctx, "update_beat", {"beat_id": ids[0], "description": "Cut."}))
+
+
+# 5. A replace that would delete nothing goes through ────────────────────────
+# (12ca9c0 refused the first generate_script on a drafted story even after a
+# yes: no scene predated the confirmation because there were no scenes.)
+
+
+def _add_scene(pid: int, created_at: str) -> None:
+    conn = get_db(settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO scenes (project_id, order_index, heading, created_at) VALUES (?, 1, ?, ?)",
+            (pid, "INT. CHAPEL - NIGHT", created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_first_script_on_a_drafted_story_goes_through(client):
+    pid, _ = _project(client, T_BEFORE, n=15)  # a story, no scenes: project 20 on 2026-09-29
+    for message, scope in (
+        ("Yes — generate the script", "info"),
+        ("yes, generate the script", None),
+        ("Yes", "destructive_replace"),
+        ("make it darker", None),
+    ):
+        ctx = _session(pid, message, card_scope=scope)
+        assert _run(ctx, "generate_script", {"replace": True})["ok"] is True, (message, scope)
+
+
+def test_script_replace_is_still_guarded_when_scenes_exist(client):
+    pid, _ = _project(client, T_BEFORE)
+    _add_scene(pid, T_BEFORE)
+    assert _blocked(_run(_session(pid, "Yes", card_scope="info"), "generate_script", {}))
+    assert _run(_session(pid, "yes, replace the script"), "generate_script", {})["ok"] is True
+
+    pid, _ = _project(client, T_BEFORE)
+    _add_scene(pid, T_AFTER)
+    out = _run(_session(pid, "yes, replace the script"), "generate_script", {"replace": True})
+    assert _blocked(out) and "created AFTER" in out["error"]
+
+
+def test_story_over_an_existing_script_needs_a_yes_not_a_seen_story(client):
+    # Scenes only: a new story orphans the script (gated), but deletes no
+    # story rows, so a yes is enough — the age rule has nothing to cover.
+    pid = client.post("/api/projects", json={"title": "Script First"}).json()["id"]
+    _add_scene(pid, T_BEFORE)
+    assert _blocked(_run(_session(pid, "Yes", card_scope="info"), "generate_story", {}))
+    assert _run(_session(pid, "yes, write a new story"), "generate_story", {})["ok"] is True
+
+
+def test_second_story_replace_blocked_even_with_an_old_script(client):
+    # The old script must not "cover" replacing the run's own fresh story.
+    pid, _ = _project(client, T_AFTER)
+    _add_scene(pid, T_BEFORE)
+    out = _run(_session(pid, "yes, replace the story"), "generate_story", {"replace": True})
+    assert _blocked(out) and "created AFTER" in out["error"]
