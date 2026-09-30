@@ -139,8 +139,11 @@ def register(registry: ToolRegistry) -> None:
                 "width/height fill (Input:width)/(Input:height) by role. "
                 "attachments are ordered local paths for (Input:image) / "
                 "(Input:character) slots. Aspect ratio in the user's prose "
-                "(e.g. 16:9) → 1920×1080 (1080p) or 1280×720 (720p); "
-                "9:16 swaps those; 1:1 → 1080×1080. "
+                "(e.g. 16:9) → 1920×1088 (1080p class) or 1280×704 (720p "
+                "class); 9:16 swaps those; 1:1 → 1088×1088. Keep both sides "
+                "multiples of 64: the render lanes round any other size (a 720 "
+                "side comes back as 704), and then the size you state is not "
+                "the size delivered. "
                 "IMAGE for a linked project: when the user wants the result "
                 "filed into Project Assets (e.g. 'create an image for character "
                 "Kira'), pass character_id/location_id/item_id (from "
@@ -171,11 +174,15 @@ def register(registry: ToolRegistry) -> None:
                     },
                     "width": {
                         "type": "integer",
-                        "description": "Optional width for (Input:width) by role",
+                        "description": (
+                            "Optional width for (Input:width) by role; a multiple of 64"
+                        ),
                     },
                     "height": {
                         "type": "integer",
-                        "description": "Optional height for (Input:height) by role",
+                        "description": (
+                            "Optional height for (Input:height) by role; a multiple of 64"
+                        ),
                     },
                     "input_values": {
                         "type": "object",
