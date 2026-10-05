@@ -39,7 +39,7 @@ def test_video_setting_uses_description_not_consistency_prompt():
 
 
 def test_system_prompt_has_setting_rule():
-    assert "9. Setting:" in MINIMAX_H3_REF_SYSTEM
+    assert "8. Setting:" in MINIMAX_H3_REF_SYSTEM
 
 
 def test_messages_always_carry_the_setting():
@@ -177,13 +177,43 @@ def _fake_plan(clip_id: int):
     return fake_plan
 
 
-def test_preview_passes_the_setting_when_the_location_gets_no_slot(client, monkeypatch):
+def _no_llm(monkeypatch):
+    """Fail the test if the default path reaches the LLM rewrite (1.5.9: it must not)."""
+
+    async def boom(self, *args, **kwargs):
+        raise AssertionError("the default compile called the LLM rewrite")
+
+    monkeypatch.setattr("calliope.agent.video_agent._H3Compiler.rewrite", boom)
+
+
+def _assert_template_has_setting(prompt: str) -> None:
+    # Since 1.5.9 the default compile is minimax_h3_ref_fallback: the location
+    # reaches it as a Setting (summary + [Shot 1]) and never as a second subject.
+    assert "set in Harbor Warehouse" in prompt
+    assert "rusted containers under sodium light" in prompt
+    assert "<Subject 1>" in prompt
+    assert "<Subject 2>" not in prompt
+    assert "no people" not in prompt
+
+
+def test_preview_template_carries_the_setting_when_the_location_gets_no_slot(client, monkeypatch):
+    from calliope.agent.video_agent import preview_clip_prompt
+
+    pid, clip_id = _one_slot_clip(client)
+    _no_llm(monkeypatch)
+
+    result = asyncio.run(preview_clip_prompt(pid, clip_id))
+    assert result["from_draft"] is False
+    _assert_template_has_setting(result["prompt"])
+
+
+def test_regenerate_passes_the_setting_when_the_location_gets_no_slot(client, monkeypatch):
     from calliope.agent.video_agent import preview_clip_prompt
 
     pid, clip_id = _one_slot_clip(client)
     seen: dict = {}
 
-    async def fake_rewrite(scene_, subjects, **kwargs):
+    async def fake_rewrite(self, scene_, subjects, **kwargs):
         seen["subjects"] = subjects
         seen["setting"] = kwargs.get("setting")
         return "COMPILED"
@@ -192,30 +222,26 @@ def test_preview_passes_the_setting_when_the_location_gets_no_slot(client, monke
         return {"ok": True, "notes": []}
 
     monkeypatch.setattr("calliope.agent.video_agent.ensure_continuity_plan", _fake_plan(clip_id))
-    monkeypatch.setattr("calliope.agent.video_agent._h3_rewrite", fake_rewrite)
+    monkeypatch.setattr("calliope.agent.video_agent._H3Compiler.rewrite", fake_rewrite)
     monkeypatch.setattr("calliope.agent.video_agent.critique_prompt", fake_critic)
 
-    result = asyncio.run(preview_clip_prompt(pid, clip_id))
+    result = asyncio.run(preview_clip_prompt(pid, clip_id, force=True))
     assert result["prompt"] == "COMPILED"
     assert [s["kind"] for s in seen["subjects"]] == ["character"]
     assert seen["setting"] == SETTING
 
 
-def test_enqueue_passes_the_setting_when_the_location_gets_no_slot(client, monkeypatch):
+def test_enqueue_template_carries_the_setting_when_the_location_gets_no_slot(client, monkeypatch):
     from calliope.agent.video_agent import enqueue_video_jobs
 
     pid, clip_id = _one_slot_clip(client)
-    seen: dict = {}
-
-    async def fake_rewrite(scene_, subjects, **kwargs):
-        seen["subjects"] = subjects
-        seen["setting"] = kwargs.get("setting")
-        return "COMPILED"
-
-    monkeypatch.setattr("calliope.agent.video_agent.ensure_continuity_plan", _fake_plan(clip_id))
-    monkeypatch.setattr("calliope.agent.video_agent._h3_rewrite", fake_rewrite)
+    _no_llm(monkeypatch)
 
     jobs = asyncio.run(enqueue_video_jobs(pid, clip_ids=[clip_id]))
     assert len(jobs) == 1
-    assert [s["kind"] for s in seen["subjects"]] == ["character"]
-    assert seen["setting"] == SETTING
+    conn = get_db(settings.db_path)
+    try:
+        row = conn.execute("SELECT payload_json FROM jobs WHERE id = ?", (jobs[0]["id"],)).fetchone()
+    finally:
+        conn.close()
+    _assert_template_has_setting(json.loads(row["payload_json"])["prompt"])
