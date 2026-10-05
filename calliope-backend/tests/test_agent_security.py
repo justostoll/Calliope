@@ -1495,18 +1495,17 @@ def test_sub_agent_survives_missing_tool_call_ids():
     class _FakeClient:
         calls = 0
 
-        async def chat_with_tools(self, messages, temperature=0.7, tools=None, tool_choice=None):
+        async def chat_stream(self, messages, temperature=0.4, tools=None, **kwargs):
             _FakeClient.calls += 1
             if _FakeClient.calls == 1:
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        # malformed: no "id", no function.name
-                        {"type": "function", "function": {"arguments": "{}"}},
-                    ],
+                yield {
+                    "type": "tool_call",
+                    # malformed: no "id", no function.name
+                    "tool_call": {"type": "function", "function": {"arguments": "{}"}},
                 }
-            return {"role": "assistant", "content": "recovered", "tool_calls": []}
+            else:
+                yield {"type": "delta", "content": "recovered"}
+            yield {"type": "done"}
 
         async def close(self):
             pass
@@ -1538,27 +1537,29 @@ def test_sub_agent_role_allowlist_enforced_at_execute():
     class _FakeClient:
         calls = 0
 
-        async def chat_with_tools(self, messages, temperature=0.7, tools=None, tool_choice=None):
+        async def chat_stream(self, messages, temperature=0.4, tools=None, **kwargs):
             _FakeClient.calls += 1
             if _FakeClient.calls == 1:
-                return {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_evil",
-                            "type": "function",
-                            # assets role must NOT be able to invoke this
-                            "function": {"name": "delete_scene", "arguments": '{"scene_id": 1}'},
-                        },
-                        {
-                            "id": "call_ok",
-                            "type": "function",
-                            "function": {"name": "get_workspace", "arguments": "{}"},
-                        },
-                    ],
+                yield {
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "call_evil",
+                        "type": "function",
+                        # assets role must NOT be able to invoke this
+                        "function": {"name": "delete_scene", "arguments": '{"scene_id": 1}'},
+                    },
                 }
-            return {"role": "assistant", "content": "done", "tool_calls": []}
+                yield {
+                    "type": "tool_call",
+                    "tool_call": {
+                        "id": "call_ok",
+                        "type": "function",
+                        "function": {"name": "get_workspace", "arguments": "{}"},
+                    },
+                }
+            else:
+                yield {"type": "delta", "content": "done"}
+            yield {"type": "done"}
 
         async def close(self):
             pass
@@ -2143,3 +2144,32 @@ def test_story_role_has_beat_editors():
     assert {"add_beat", "update_beat"} <= names
     # delete_beat is destructive but not approval-gated; it should resolve too
     assert "delete_beat" in names
+
+
+def test_story_role_can_backfill_the_cast():
+    """A story task naming characters/locations/items must be able to create them.
+
+    generate_story seeds the cast only when the model's brief included it. When
+    it did not, the agent had no tool at all and could only report an empty
+    cast — which is exactly what happened on project 3 (observed 2026-10-03,
+    beats=50 but characters/locations/items=0 and a story agent with no recourse).
+    """
+    from calliope.agent.harness.orchestrator import ROLE_TOOLS, _scoped_payload
+
+    expected = {
+        "add_character",
+        "update_character",
+        "delete_character",
+        "add_location",
+        "update_location",
+        "delete_location",
+        "add_item",
+        "update_item",
+        "delete_item",
+    }
+    assert expected <= set(ROLE_TOOLS["story"])
+    # Still reachable from assets — the standard edit pipeline must not regress.
+    assert expected <= set(ROLE_TOOLS["assets"])
+    ctx = ToolContext(session_id=9_999_005, project_id=99)
+    names = {t["function"]["name"] for t in _scoped_payload(ctx, ROLE_TOOLS["story"])}
+    assert expected <= names, sorted(expected - names)

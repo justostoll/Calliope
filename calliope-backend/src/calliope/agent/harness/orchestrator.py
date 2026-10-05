@@ -42,6 +42,50 @@ def _llm_for_role(role: str) -> LLMClient:
         return for_role(role)
     return factory()
 
+
+# Tables whose row count is the honest measure of "did the swarm do anything".
+_CONTENT_TABLES = ("story_beats", "characters", "locations", "items", "scenes", "clips")
+
+
+def _content_counts(project_id: int | None) -> dict[str, int] | None:
+    """How much content the project actually holds, per table.
+
+    Read straight from the DB because it is the one source the synthesis LLM
+    cannot argue with: a sub-agent's self-report is a claim, this is the state.
+
+    Returns None when the counts could not be read at all, which is deliberately
+    distinct from all-zeros. "I could not check" and "I checked and it is empty"
+    must not collapse into the same value, or a DB error would make the swarm
+    announce that nothing was produced on a project that is actually full.
+    """
+    if project_id is None:
+        return None
+    conn = None
+    try:
+        from calliope.agent.harness.registry import _db
+
+        conn = _db()
+        counts: dict[str, int] = {}
+        for table in _CONTENT_TABLES:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            counts[table] = int(row["n"]) if row is not None else 0
+        return counts
+    except Exception:  # noqa: BLE001 — report "unknown", never a fake zero
+        logger.exception("Content counts unavailable for project %s", project_id)
+        return None
+    finally:
+        # get_db hands out a fresh connection per call; leaving it open pins the
+        # file, and on Windows that makes the DB undeletable — which broke test
+        # teardown for every suite that runs a swarm turn.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("Closing count connection failed", exc_info=True)
+
 # LLM context window bound: the last N user turns are replayed into each
 # request. Tool exchanges never span user turns, so tool_call/result pairs
 # always survive the trim intact.
@@ -108,12 +152,18 @@ def _is_trivial_goal(goal: str) -> bool:
 
 
 def _history_char_budget() -> int | None:
-    """Character budget for derived LLM history; 0 disables."""
+    """Character ceiling for derived LLM history; None disables trimming.
+
+    Delegates to Settings.history_char_budget() so the ceiling tracks the
+    serving model's reported context window instead of a fixed constant that
+    silently overflowed on Chinese content.
+    """
     try:
-        raw = int(getattr(settings, "agent_history_char_budget", 0) or 0)
-    except (TypeError, ValueError):
+        derived = settings.history_char_budget()
+    except Exception:  # noqa: BLE001 — trimming must never break a turn
+        logger.warning("Could not derive the history char budget; leaving history untrimmed")
         return None
-    return raw if raw > 0 else None
+    return derived if derived > 0 else None
 
 
 def _last_asked_question(session_id: int) -> str:
@@ -137,11 +187,34 @@ def _last_asked_question(session_id: int) -> str:
 ROLE_TOOLS: dict[str, list[str]] = {
     "story": [
         "get_workspace",
+        # Scratch file tools (plugins/files.py): draft scripts/beat lists/
+        # shot plans as text files in the session workspace — shared with the
+        # main loop and sibling sub-agents. Committing content stays with the
+        # DB tools below; the files are the working medium, not the store.
+        "list_files",
+        "read_file",
+        "write_file",
+        "delete_file",
         "get_story",
         "generate_story",
         "add_beat",
         "update_beat",
         "delete_beat",
+        # Cast/locations/items belong to the STORY, and generate_story seeds
+        # them only if the model's first brief happened to include them. When
+        # it does not, the agent needs a way to add what is missing rather than
+        # reporting an empty cast (observed 2026-10-03, project 3: the brief
+        # returned 4 characters but the story agent had no tool to add any, so
+        # a task naming characters/locations/items could only give up).
+        "add_character",
+        "update_character",
+        "delete_character",
+        "add_location",
+        "update_location",
+        "delete_location",
+        "add_item",
+        "update_item",
+        "delete_item",
         # Story tasks may structure beats INTO scenes — the planner schedules
         # "break the beats into an 8-scene structure" as a story task, and a
         # story agent without scene tools dead-ends with "add_scene is not
@@ -164,6 +237,10 @@ ROLE_TOOLS: dict[str, list[str]] = {
     ],
     "script": [
         "get_workspace",
+        "list_files",
+        "read_file",
+        "write_file",
+        "delete_file",
         "list_scenes",
         "list_clips",
         "generate_script",
@@ -185,6 +262,10 @@ ROLE_TOOLS: dict[str, list[str]] = {
     ],
     "assets": [
         "get_workspace",
+        "list_files",
+        "read_file",
+        "write_file",
+        "delete_file",
         "add_character",
         "update_character",
         "delete_character",
@@ -214,6 +295,10 @@ ROLE_TOOLS: dict[str, list[str]] = {
     ],
     "video": [
         "get_workspace",
+        "list_files",
+        "read_file",
+        "write_file",
+        "delete_file",
         "list_scenes",
         "list_clips",
         "list_workflows",
@@ -250,7 +335,7 @@ Respond with ONLY a JSON object:
 
 Rules:
 - The standard EDIT pipeline (story → script → add/update assets text) is swarm work: one task per role, in that order.
-- ROLE BOUNDARIES: the story role owns BEATS (beats, characters, locations via generate_story/add_beat) — it cannot create scenes. The script role owns SCENES (add_scene, generate_script, break_into_shots). A "turn the story into N scenes" plan is a SCRIPT task; never schedule add_scene under the story role (session 908: a story task told to add_scene reported "tool not available to this role" and the whole build stalled).
+- ROLE BOUNDARIES: the story role owns the STORY BOARD — beats, characters, locations and items (generate_story, add_beat, add_character/add_location/add_item). generate_story seeds the cast only if the model's brief included it, and it reports the true count of every table it wrote (`generated.characters` etc.), so a story task that names the cast must check those numbers and add whatever came back missing rather than reporting an empty cast (observed 2026-10-03: the tool said "beats: 50" only, the agent concluded the cast did not exist, and stopped). The script role owns SCENES and the script (generate_script, break_into_shots, add_scene). Schedule scene work under the script role.
 - Image/video GENERATION is human-in-the-loop, but the user's EXPLICIT choices grant permission: tagging a workflow (@mention), asking to "generate/render/create an image", or confirming an offer all count. When the user tagged a workflow AND named entities (characters/locations/scenes), schedule a single assets task whose goal says: run_workflow with the tagged workflow_id + per-entity prompts (character_ids=[…] for multiple characters), wait_for_jobs, then post_artifact_to_canvas for each output.
 - When ANY task involves generating videos/clips (enqueue_video_jobs / run_workflow for clips), the video role's tools are visible only if the user's message carries render intent — phrase that task's goal so the sub-agent first calls ask_user to confirm scope when unsure, rather than reporting "the generation tool is not exposed". Never schedule a render task and a text-only pass of the same scope.
 - For text-only edits (add/update characters, locations, items, scenes, story, script) with NO generation ask, schedule the edit task and DO NOT schedule render tasks.
@@ -301,10 +386,11 @@ def _scoped_payload(ctx: ToolContext, allowed: list[str]) -> list[dict[str, Any]
     return out
 
 
-async def _plan(goal: str, workspace_summary: str) -> dict[str, Any]:
+async def _plan(goal: str, workspace_summary: str, session_id: int) -> dict[str, Any]:
     client = _llm_for_role("planner")
     try:
-        text = await client.chat(
+        content: list[str] = []
+        async for ev in client.chat_stream(
             [
                 {"role": "system", "content": PLANNER_SYSTEM},
                 {
@@ -313,7 +399,18 @@ async def _plan(goal: str, workspace_summary: str) -> dict[str, Any]:
                 },
             ],
             temperature=0.2,
-        )
+        ):
+            if ev["type"] == "delta":
+                content.append(ev["content"])
+            elif ev["type"] == "reasoning":
+                # The working-state card has nothing else to show until the
+                # plan lands — stream the planner's thinking so the wait is
+                # visible (the UI renders agent.thinking from any agent).
+                await event_bus.publish(
+                    "agent.thinking",
+                    {"session_id": session_id, "agent_name": "planner", "content": ev["content"]},
+                )
+        text = "".join(content)
     except Exception:
         # Transient LLM failure must not kill the turn — degrade to the
         # single loop, which retries the LLM with its own error handling.
@@ -397,7 +494,7 @@ async def orchestrate(
     if len(summary) > 3000:
         summary = summary[:3000] + "…[truncated]"
 
-    plan = await _plan(goal, summary)
+    plan = await _plan(goal, summary, session_id)
     note = (plan.get("note") or "").strip()
     if note:
         session_log.append_event(
@@ -617,12 +714,30 @@ async def orchestrate(
         await emit({"role": "assistant", "content": final})
         return final
 
+    # Ground truth before synthesis. A sub-agent that stops early reports itself
+    # in one word ("Done."), and the synthesis LLM will happily expand that into
+    # a full page of work it never did (observed live 2026-10-03, project 3
+    # 意识回收计划: zero beats/characters/locations created, final message claimed
+    # "beats, characters, environments, and misc. items were produced"). The
+    # counts below are read from the DB, so they cannot be talked into agreeing.
+    produced = _content_counts(ctx.project_id)
+    counts_text = (
+        ", ".join(f"{k}={v}" for k, v in produced.items())
+        if produced is not None
+        else "unavailable (could not be read)"
+    )
+
     # Synthesis: plain LLM call over sub-agent reports.
     synthesis_in = (
         "User goal:\n"
         f"{goal}\n\nSub-agent reports:\n" + "\n\n".join(results)
+        + "\n\nActual content in the project right now (authoritative): "
+        + counts_text
         + "\n\nWrite a concise final summary for the user: what was done, "
-        "job ids enqueued, and any failures. Plain text."
+        "job ids enqueued, and any failures. Plain text. "
+        "Report ONLY what the counts above and the reports actually show. "
+        "If a count is 0, say plainly that nothing was created — never infer "
+        "completed work from a report that merely claims it."
     )
     client = _llm_for_role("planner")
     try:
@@ -630,7 +745,13 @@ async def orchestrate(
             [
                 {
                     "role": "system",
-                    "content": "You are the swarm's lead. Summarize sub-agent work for the user. Be concrete.",
+                    "content": (
+                        "You are the swarm's lead. Summarize sub-agent work for "
+                        "the user. Be concrete, and never overstate it: the "
+                        "project's real content counts are given to you and are "
+                        "the authority on what exists. A sub-agent saying 'Done.' "
+                        "does not mean the work happened."
+                    ),
                 },
                 {"role": "user", "content": synthesis_in},
             ],
@@ -644,6 +765,23 @@ async def orchestrate(
         final = "Work finished. Sub-agent reports:\n\n" + "\n\n".join(results)
     finally:
         await client.close()
+
+    # Prompting is not a guarantee. When a story/script goal left the project
+    # completely empty, prepend the fact regardless of what the summary claims —
+    # a confident false "all content was produced" is the one failure mode the
+    # operator cannot detect on their own (they see the empty project and the
+    # contradicting message, and have to guess which one is lying).
+    if produced is not None and not any(produced.values()):
+        truth = (
+            "No content was created. The project is still empty "
+            f"({', '.join(f'{k}=0' for k in produced)}), "
+            "so nothing was actually produced this turn."
+        )
+        logger.warning(
+            "Swarm produced no content for project %s: %s", ctx.project_id, truth
+        )
+        final = truth + "\n\n" + final
+
     session_log.append_event(
         session_id,
         session_log.ASSISTANT_MESSAGE,
@@ -662,10 +800,11 @@ async def _run_sub_agent(
     max_iterations: int | None = None,
     on_message: MessageSink | None = None,
 ) -> str:
-    """A scoped agentic loop for one sub-agent (non-streaming variant).
+    """A scoped agentic loop for one sub-agent.
 
     Unlike run_turn this does not publish token events for every sub-agent —
-    only tool events carry the agent_name so the UI can group them.
+    tool events and the reasoning channel (agent.thinking) carry the
+    agent_name so the UI can group them.
     """
     if max_iterations is None:
         max_iterations = _default_max_iterations()
@@ -696,15 +835,21 @@ async def _run_sub_agent(
         "the whole timeline. Never add_scene to attach an mp4. For "
         "text-only edits, do the edit and stop."
     )
-    # Memory + skills sections, same content the main loop renders (order 35
-    # / 37). Rendered ONCE here: a sub-agent lives for one task, and memory
-    # recall doubles as use-count accounting, so per-step re-render would
-    # inflate ranking. Sections stay None when there is nothing to show.
+    # Memory + skills + scratch-workspace sections, same content the main loop
+    # renders (order 35 / 37 / 32). Rendered ONCE here: a sub-agent lives for
+    # one task, and memory recall doubles as use-count accounting, so per-step
+    # re-render would inflate ranking. Sections stay None when there is nothing
+    # to show (files_prompt_text is None for scene origin).
+    from calliope.agent.harness.plugins.files import files_prompt_text
     from calliope.agent.harness.plugins.memory import memory_prompt_text
     from calliope.agent.harness.plugins.skills import skills_prompt_text
 
     try:
-        for section in (memory_prompt_text(ctx), skills_prompt_text(ctx)):
+        for section in (
+            memory_prompt_text(ctx),
+            skills_prompt_text(ctx),
+            files_prompt_text(ctx),
+        ):
             if section:
                 system += "\n\n" + section
     except Exception:  # noqa: BLE001 — prompt garnish must never kill a task
@@ -733,12 +878,46 @@ async def _run_sub_agent(
             if max_iterations - iteration == 0:
                 # Final-step budget nudge: wrap up, don't start new work.
                 step_messages.append({"role": "user", "content": FINAL_STEP_NUDGE})
-            msg = await client.chat_with_tools(
+            content_acc: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            async for ev in client.chat_stream(
                 [{"role": "system", "content": system}] + step_messages,
                 temperature=0.3,
                 tools=payload or None,
-            )
-            tool_calls = msg.get("tool_calls") or []
+            ):
+                if ev["type"] == "delta":
+                    content_acc.append(ev["content"])
+                elif ev["type"] == "reasoning":
+                    # Between tool events a sub-agent used to be a bare
+                    # "working…" pill for minutes on a local model — stream
+                    # its reasoning so the wait is visible. Token events stay
+                    # unpublished (final text arrives as one assistant
+                    # message); the UI consumes agent.thinking from any agent.
+                    await event_bus.publish(
+                        "agent.thinking",
+                        {
+                            "session_id": ctx.session_id,
+                            "agent_name": agent_name,
+                            "content": ev["content"],
+                        },
+                    )
+                elif ev["type"] == "tool_call":
+                    tool_calls.append(ev["tool_call"])
+            msg: dict[str, Any] = {"role": "assistant", "content": "".join(content_acc) or None}
+            if tool_calls:
+                # Normalize like the old chat_with_tools path did — some
+                # OpenAI-compatible servers omit id/name on tool calls.
+                msg["tool_calls"] = [
+                    {
+                        "id": tc.get("id") or f"call_{id(tc) & 0xFFFFFF:x}",
+                        "type": "function",
+                        "function": {
+                            "name": (tc.get("function") or {}).get("name") or "unknown_tool",
+                            "arguments": (tc.get("function") or {}).get("arguments") or "{}",
+                        },
+                    }
+                    for tc in tool_calls
+                ]
             messages.append(msg)
             if not tool_calls:
                 final = (msg.get("content") or "").strip()

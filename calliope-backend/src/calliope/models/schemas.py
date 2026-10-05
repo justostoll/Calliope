@@ -151,9 +151,8 @@ class SceneUpdate(BaseModel):
     character_ids: list[int] | None = None
     location_id: int | None = None
     video_path: str | None = None
-    chain_from_prev: bool | None = None
-    # Persisted video-stage setup: form input_values, clip source, prompt
-    # draft + metadata. Serialized into scenes.video_settings_json.
+    # Persisted video-stage setup: form input_values, prompt draft + metadata.
+    # Serialized into scenes.video_settings_json.
     video_settings: dict[str, Any] | None = None
 
 
@@ -168,7 +167,6 @@ class ClipCreate(BaseModel):
     dialog_lines_covered: list[int] | None = None
     duration_sec: int | None = None
     workflow_id: int | None = None
-    chain_from_prev: bool = False
     video_settings: dict[str, Any] | None = None
 
 
@@ -180,7 +178,6 @@ class ClipUpdate(BaseModel):
     duration_sec: int | None = None
     workflow_id: int | None = None
     clip_path: str | None = None
-    chain_from_prev: bool | None = None
     video_settings: dict[str, Any] | None = None
 
 
@@ -200,6 +197,7 @@ class WorkflowCreate(BaseModel):
     workflow_json: dict[str, Any]
     description: str | None = None
     prompt_profile: Literal["prose", "minimax_h3_ref"] | None = None
+    strict_mode: bool = True
 
 
 class WorkflowUpdate(BaseModel):
@@ -208,6 +206,8 @@ class WorkflowUpdate(BaseModel):
     description: str | None = None
     prompt_profile: Literal["prose", "minimax_h3_ref"] | None = None
     is_enabled: bool | None = None
+    strict_mode: bool | None = None
+    workflow_json: dict[str, Any] | None = None
 
 
 class WorkflowAnalyze(BaseModel):
@@ -263,4 +263,21 @@ class PreviewPromptRequest(BaseModel):
     # H3 rewrite must describe; they win over the saved clip setup.
     input_values: dict[str, Any] | None = None
     # Skip a fresh saved draft and rewrite from the current references.
+    force: bool = False
+
+
+class BatchPromptRequest(BaseModel):
+    """Compile many clips' H3 prompts up front. Queues no render.
+
+    Leave ``clip_ids`` empty for the whole project (in playback order) — that is
+    the "fill in the gaps" case. Pass one id to recompile a single shot.
+    """
+
+    clip_ids: list[int] | None = None
+    workflow_id: int | None = None
+    input_values: dict[str, Any] | None = None
+    only_missing: bool = False
+    save: bool = True
+    # Default false: compile = the instant deterministic template. force=true
+    # asks the LLM for a fresh rewrite per clip (slow — one call per clip).
     force: bool = False

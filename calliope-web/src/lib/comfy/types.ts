@@ -35,6 +35,7 @@ export interface Workflow {
 	description: string | null;
 	prompt_profile: string;
 	is_enabled: boolean;
+	strict_mode: boolean;
 }
 
 export interface Job {
@@ -57,8 +58,6 @@ export interface Job {
 
 export interface SceneVideoSettings {
 	input_values?: Record<string, string | number>;
-	/** 'auto' | 'upload' | target scene id as string. */
-	clip_source?: string;
 	form_workflow_id?: number;
 	prompt_draft?: string;
 	prompt_draft_meta?: { based_on?: string; saved_at?: string };
@@ -77,7 +76,6 @@ export interface Scene {
 	env_image_path: string | null;
 	location_id: number | null;
 	video_path: string | null;
-	chain_from_prev?: number | boolean | null;
 	video_settings?: SceneVideoSettings | null;
 	character_ids: number[];
 	characters: Array<{
@@ -102,7 +100,6 @@ export interface Clip {
 	duration_sec: number | null;
 	workflow_id: number | null;
 	clip_path: string | null;
-	chain_from_prev?: number | boolean | null;
 	video_settings?: SceneVideoSettings | null;
 	/** '#3.2' — scene 3, clip 2 (display label). */
 	label?: string;

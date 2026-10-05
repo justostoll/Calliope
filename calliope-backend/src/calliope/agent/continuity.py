@@ -443,12 +443,12 @@ def _board_digest(board: dict[str, Any]) -> str:
 def _h3_extra_body() -> dict[str, Any] | None:
     """The H3 rewrite's per-call request extras, reused by the continuity plan.
 
-    The plan runs inside the H3 compile path on the same model as the rewrite.
-    With a thinking model and no extras it reasoned for 6,415 tokens / 216 s on
-    this host; with them, 1,936 tokens / 65 s and still well-formed. The critic
-    deliberately does NOT use this: with thinking off it answered in seconds, but
-    two of its three notes contradicted the prompt it judged, so it keeps the
-    model's default (it only annotates the review modal and never blocks Generate).
+    The plan runs in the H3 compile path on the same model as the rewrite. On a
+    thinking model without these extras it reasons at length for a JSON answer
+    (qwen3.8-27b via oMLX: 6,415 tokens / 216 s; with them 1,936 tokens / 65 s and
+    still a well-formed plan). The critic deliberately keeps the model's default:
+    with thinking off it answered in seconds, but two of its three notes
+    contradicted the prompt it judged.
     """
     return settings.h3_rewrite_extra_body or None
 
@@ -473,6 +473,17 @@ async def _llm_plan(board: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("continuity plan was not a JSON object")
     return data
+
+
+def stored_continuity_plan(project_id: int) -> dict[str, Any] | None:
+    """The persisted plan, loaded without any LLM refresh — cheap read.
+
+    Used by the instant compile paths (preview/enqueue) that only need the
+    plan's ``based_on`` for draft-hash stability. Use ``ensure_continuity_plan``
+    when a refresh is actually wanted (explicit Regenerate / the agent tool).
+    """
+    board = load_board(project_id)
+    return _parse_stored(board["project"].get("continuity_json"))
 
 
 async def ensure_continuity_plan(
@@ -516,7 +527,7 @@ def continuity_lock_text(plan: dict[str, Any] | None, clip_id: int) -> str:
         "These lines are binding.",
         "Phrase them into the six H3 sections.",
         "Do not recast a subject, move a dialogue line to another speaker, or change lighting or screen direction.",
-        "Reference images and the reference video remain the identity and motion source.",
+        "Reference images remain the identity source.",
     ]
     overview = plan.get("overview") if isinstance(plan.get("overview"), dict) else {}
     for key in OVERVIEW_KEYS:

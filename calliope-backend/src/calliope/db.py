@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS workflows (
     description TEXT,
     prompt_profile TEXT NOT NULL DEFAULT 'prose',
     is_enabled INTEGER NOT NULL DEFAULT 1,
+    strict_mode INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -319,6 +320,13 @@ async def migrate_db(db_path: Path) -> None:
         conn.execute(
             "ALTER TABLE workflows ADD COLUMN prompt_profile TEXT NOT NULL DEFAULT 'prose'"
         )
+    if "strict_mode" not in cols:
+        # Strict mode is ON by default (and backfilled ON for existing rows):
+        # exposed (Input:*) prompt/reference slots must not inherit the
+        # workflow's baked-in default, so a stray test reference can't leak.
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN strict_mode INTEGER NOT NULL DEFAULT 1"
+        )
     scene_cols = {r[1] for r in conn.execute("PRAGMA table_info(scenes)").fetchall()}
     if "location_id" not in scene_cols:
         conn.execute("ALTER TABLE scenes ADD COLUMN location_id INTEGER")
@@ -397,17 +405,16 @@ def ensure_default_clip(conn: sqlite3.Connection, scene_id: int, project_id: int
     """Every scene keeps >= 1 clip: inserts default clip #1 when none exist.
 
     The default inherits the scene's production fields (duration, workflow,
-    settings, chain) so an un-expanded project behaves exactly like the old
-    1:1 model. Called by every scene-creation path (router CRUD, script
+    settings) so an un-expanded project behaves exactly like the old 1:1
+    model. Called by every scene-creation path (router CRUD, script
     generation, coverage expansion replacement).
     """
     conn.execute(
         """
         INSERT INTO clips (scene_id, project_id, order_index, description,
-                           duration_sec, workflow_id, clip_path, video_settings_json,
-                           chain_from_prev)
+                           duration_sec, workflow_id, clip_path, video_settings_json)
         SELECT ?, ?, 1, NULL, duration_sec, workflow_id, video_path,
-               video_settings_json, chain_from_prev
+               video_settings_json
         FROM scenes s
         WHERE s.id = ? AND s.project_id = ?
           AND NOT EXISTS (SELECT 1 FROM clips WHERE scene_id = ?)
